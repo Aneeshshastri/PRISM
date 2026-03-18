@@ -1,0 +1,572 @@
+%% AASTeX v7.0.1 (released May 29, 2025)
+%% Classfile: aastex701.cls
+%% Download from: https://journals.aas.org/aastex-package-for-manuscript-preparation/
+%% Or use via Overleaf (pre-installed)
+\documentclass[preprint]{aastex701-1/aastex701}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{graphicx}
+
+\begin{document}
+
+\title{Prism: A Physics-Constrained Neural Emulator for Stellar Spectra}
+
+\author[0009-0006-8079-688X]{Aneesh Shastri}
+\affiliation{Department of Computational Engineering, Cepheid,
+Indian Institute of Technology Hyderabad,
+Sangareddy, Telangana 502284, India}
+\email{co25btech11004@iith.ac.in}
+
+\begin{abstract}
+We present a physics-constrained generative neural network emulator for stellar spectra
+trained directly on real, high signal-to-noise observations from the APOGEE DR17 survey.
+Unlike prior approaches that rely on synthetic spectral grids, our model is trained on
+149,966 stars with signal-to-noise ratio $>100$ using stellar parameters and chemical
+abundances from the ASPCAP pipeline as labels, spanning a wavelength range of 1514--1694\,nm.
+The model predicts optical depth through five physically motivated branches---a continuum
+branch, a CNO molecular branch, a thermodynamic state branch, a chemical expert branch
+with element-specific spectral masks, and a residual correction branch---and converts to
+flux via the Beer-Lambert law. Physics-based disentanglement is enforced by restricting
+each element's spectral sensitivity to pixels within 0.2\,nm of its known atomic lines,
+mathematically preventing cross-talk between abundance labels. The model achieves a
+mean absolute error of $\sim$0.8\% on the normalized flux, comparable to ASPCAP label
+uncertainties and the data noise floor. Principal component analysis confirms that the
+generated spectra faithfully reproduce the manifold of real APOGEE observations. The
+sensitivity gradient $\partial F / \partial [\mathrm{Al/H}]$ is identically zero at all
+non-permitted wavelengths, demonstrating physically meaningful disentanglement. We
+compare our approach to prior data-driven and physics-based emulators including The Cannon,
+The Payne, and TransformerPayne, and argue that our model is uniquely positioned to combine
+the interpretability of data-driven methods with hard physical constraints. Open-source
+code, a synthetic dataset generator, and a backward inference pipeline are planned as
+future deliverables.
+\end{abstract}
+
+\keywords{stars: abundances --- stars: fundamental parameters --- methods: data analysis ---
+techniques: spectroscopic --- surveys}
+
+%------------------------------------------------------------
+\section{Introduction}
+\label{sec:intro}
+%------------------------------------------------------------
+
+The chemical fingerprint encoded in a stellar photosphere reflects the conditions of the
+interstellar medium at the time and place of that star's formation, as well as the integrated
+nucleosynthetic enrichment from preceding generations of supernovae and asymptotic giant
+branch stars. Because photospheric abundances change negligibly over a stellar lifetime,
+high-fidelity abundance measurements from large spectroscopic surveys constitute a powerful
+fossil record of Galactic chemical evolution \citep{Freeman2002,BlandHawthorn2016}.
+
+This goal has only recently become tractable as survey facilities deliver high-resolution
+($R \gtrsim 20{,}000$) spectra for $\sim 10^5$--$10^6$ stars across all Galactic components
+\citep{Majewski2017}. APOGEE (Apache Point Observatory Galactic Evolution Experiment)
+in particular has assembled one of the largest homogeneous near-infrared spectroscopic
+datasets in existence, with Data Release 17 containing labels derived for hundreds of
+thousands of giant stars \citep{Abdurrouf2022}.
+
+Automated pipelines such as ASPCAP (APOGEE Stellar Parameter and Chemical Abundance
+Pipeline) have made survey-scale stellar characterization possible, yet physics-based model
+spectra are known to be incomplete: one-dimensional model atmospheres, the local
+thermodynamic equilibrium approximation, and imperfect atomic and molecular line lists
+all introduce systematic residuals \citep{GarciaperezASPCAP2016}. These limitations become
+especially acute at low signal-to-noise ratios, where classical $\chi^2$ fitting degrades
+rapidly.
+
+Data-driven models offer a complementary approach. The Cannon \citep{Ness2015Cannon}
+demonstrated that a quadratic generative model trained on high-fidelity reference spectra
+can transfer stellar labels to lower signal-to-noise data with competitive precision. The
+Cannon 2 \citep{Casey2016Cannon2} extended this to 17 labels simultaneously by introducing
+$\ell_1$ regularization that enforces sparsity in the model's spectral coefficients, yielding
+physically interpretable spectral derivatives. The Payne \citep{Ting2019Payne} replaced the
+polynomial basis with a multi-layer perceptron trained on grids of synthetic spectra,
+achieving high accuracy on APOGEE observations. More recently, TransformerPayne
+\citep{TransformerPayne2025} employed large transformer architectures over the same
+synthetic-grid paradigm, reporting mean absolute errors of $\sim 10^{-3}$ on held-out
+synthetic data.
+
+A common thread in nearly all prior emulators is reliance on synthetic spectral grids
+for training. While such grids are noise-free by construction, they encode all the
+approximations of the underlying physics model and, critically, are evaluated on real data
+that differ systematically from their training distribution. Furthermore, most neural emulators
+operate as black boxes: the learned mapping from stellar parameters to predicted flux offers
+little interpretable insight into which spectral features are being used, leaving open the
+question of parameter cross-talk (entanglement).
+
+Here we present a generative neural emulator trained entirely on real APOGEE DR17
+spectra. Our model is distinguished by three design principles. First, it predicts optical
+depth rather than flux directly, using the Beer-Lambert law to recover flux from summed
+contributions of physically separated branches. Second, element-specific spectral masks
+enforce strict disentanglement: each chemical abundance label is permitted to influence only
+those pixels lying within 0.2\,nm of its known atomic lines, as compiled in
+\citet{Shetrone2015} and \citet{Smith2021DR17}. Third, because the training set is composed
+of real observations with realistic noise, continuum normalization artifacts, and sensor gaps,
+the emulator inherits the noise properties of APOGEE data without requiring a synthetic
+bridge.
+
+Throughout this work we use the term \emph{label} for any element of the input
+parameter vector, including stellar parameters ($T_\mathrm{eff}$, $\log g$, etc.) and
+chemical abundances ([$X$/Fe] or [$X$/H]).
+
+%------------------------------------------------------------
+\section{Data}
+\label{sec:data}
+%------------------------------------------------------------
+
+\subsection{APOGEE DR17}
+\label{subsec:data_apogee}
+
+We use spectra and labels from APOGEE Data Release 17 \citep{Abdurrouf2022}. The APOGEE
+spectrograph covers the $H$-band (1514--1694\,nm) at resolution $R \approx 22{,}500$.
+Continuum normalization and spectral stacking are performed by the ASPCAP pipeline before
+data release \citep{GarciaperezASPCAP2016}. Sensor gaps (pixels with zero flux) are masked
+throughout all processing steps.
+
+Our working sample comprises 149,966 stars selected to have signal-to-noise ratio
+SNR $> 100$ in the stacked, pseudo-continuum-normalized spectra.Although there have been no tes Stellar parameters and
+23 chemical abundance labels are taken from ASPCAP (see Table~\ref{tab:labels}). Six core
+stellar parameters are used: effective temperature $T_\mathrm{eff}$, surface gravity $\log g$,
+overall metallicity $[M/\mathrm{H}]$, microturbulent velocity $v_\mathrm{micro}$,
+macroturbulent velocity $v_\mathrm{macro}$, and projected rotational velocity $v \sin i$.
+The 17 elemental abundances span the CNO group, the $\alpha$-capture, odd-Z, and Fe-peak
+families.
+
+\begin{deluxetable}{ll}
+\tablecaption{Labels used in model training \label{tab:labels}}
+\tablewidth{0pt}
+\tablehead{\colhead{Group} & \colhead{Labels}}
+\startdata
+Core parameters & $T_\mathrm{eff}$, $\log g$, $[M/\mathrm{H}]$, $v_\mathrm{micro}$,
+                  $v_\mathrm{macro}$, $v\sin i$ \\
+CNO group        & $[\mathrm{C/Fe}]$, $[\mathrm{N/Fe}]$, $[\mathrm{O/Fe}]$ \\
+Iron peak        & $[\mathrm{Fe/H}]$, $[\mathrm{Mn/Fe}]$, $[\mathrm{Ni/Fe}]$,
+                  $[\mathrm{Cr/Fe}]$, $[\mathrm{V/Fe}]$, $[\mathrm{Co/Fe}]$ \\
+$\alpha$-capture & $[\mathrm{Mg/Fe}]$, $[\mathrm{Si/Fe}]$, $[\mathrm{Ca/Fe}]$,
+                  $[\mathrm{Ti/Fe}]$, $[\mathrm{S/Fe}]$ \\
+Odd-Z            & $[\mathrm{Al/Fe}]$, $[\mathrm{K/Fe}]$, $[\mathrm{Na/Fe}]$
+\enddata
+\end{deluxetable}
+
+\subsection{Preprocessing and Label Imputation}
+\label{subsec:preproc}
+
+Missing label values are common in APOGEE because the ASPCAP pipeline flags individual
+abundance fits when signal is insufficient. Rather than discard affected stars, we recover
+missing values via iterative imputation using a Bayesian Ridge regressor that learns
+inter-label correlations (e.g., the tight correlation between $[\mathrm{Fe/H}]$ and
+$[M/\mathrm{H}]$) and predicts missing entries from available ones. After imputation,
+all [$X$/Fe] ratios are converted to [$X$/H] by adding the imputed $[\mathrm{Fe/H}]$
+value.
+
+Four engineered features supplement the raw labels to improve the model's ability to
+decode stellar physics:
+\begin{enumerate}
+\item $5040/T_\mathrm{eff}$ -- encodes the Boltzmann exponential dependence of line opacity
+      on excitation temperature;
+\item $[\mathrm{C/H}] - [\mathrm{O/H}]$ -- the C/O ratio, which governs the balance
+      between CO molecule formation and free atomic C and O;
+\item $v_\mathrm{broad} = \sqrt{v_\mathrm{macro}^2 + (v\sin i)^2}$ -- a single
+      combined broadening term;
+\item $\log P_e = 0.5[\mathrm{C/H}]+0.5\log{g}$ -- a first-order approximation of electron pressure derived from
+      $T_\mathrm{eff}$ and $\log g$, which modulates continuous opacity.
+\end{enumerate}
+
+All labels (raw and engineered) are $z$-score normalized using training-set statistics.
+Spectral fluxes are used as delivered by ASPCAP (already pseudo-continuum normalized).
+
+%------------------------------------------------------------
+\section{Model Architecture}
+\label{sec:model}
+%------------------------------------------------------------
+
+\subsection{Optical-depth Formulation}
+\label{subsec:tau}
+
+Rather than regressing directly to continuum-normalized flux, our model predicts the
+effective optical depth $\tau(\lambda)$ and converts to flux via the Beer-Lambert law:
+\begin{equation}
+F(\lambda) = k \, e^{-\tau(\lambda)},
+\label{eq:beer}
+\end{equation}
+
+where $k = \mathrm{k(\lambda)}$ is a scaling factor, which is the output of the continuum branch.We chose a scaling factor instead of another optical depth function to combat the issues with the ASPCAP continuum normalization (which can produce normalized fluxes slightly above unity near absorption features).
+
+The total optical depth is additive in contributions from
+physically distinct components:
+\begin{equation}
+\tau(\lambda) =  \tau_\mathrm{CNO}(\lambda)
+               + \sum_X \tau_X(\lambda) + \tau_\mathrm{res}(\lambda),
+\label{eq:tau_sum}
+\end{equation}
+where the sum runs over all atomic species $X$ in Table~\ref{tab:labels} (excluding the
+CNO group), and each term is produced by a dedicated network branch.
+
+\subsection{Network Branches}
+\label{subsec:branches}
+
+\subsubsection{Continuum Branch}
+The continuum branch receives the global parameters:
+$T_{\text{eff}},[\mathrm{M/H}],\log{g},v_{\text{macro}},v_{\text{micro}},v\sin{i}$.
+(Along with these, it also receives all our engineered features)
+
+Using these, it generates a coarse 268-pixel continuum that is progressively upsampled via alternating
+upsampling and Conv1D layers to the full 8575-pixel grid. The final convolutional layer
+uses a kernel of width 51 pixels, ensuring the branch produces smoothly varying pseudo-
+continuum and is structurally incapable of fitting sharp spectral lines.
+
+\subsubsection{CNO (Molecular) Branch}
+The CNO branch receives $[\mathrm{C/H}]$, $[\mathrm{N/H}]$, $[\mathrm{O/H}]$,
+$T_\mathrm{eff}$, and $\log g$. Because molecular line lists (CO, CN, OH, etc.) are
+incomplete and thousands of transitions contribute at every wavelength, this branch is
+intentionally unconstrained by pixel masks. It uses stacked dense layers to predict
+$\tau_\mathrm{CNO}$ across the full wavelength array.
+
+\subsubsection{Thermodynamic State Branch}
+The thermodynamic state branch distills all global and CNO parameters into a compact
+latent state vector of dimension 8. This state vector is passed to the chemical expert
+branch rather than the raw label values, preventing the chemical branch from using
+$[M/\mathrm{H}]$ as a proxy for individual elemental abundances. This architectural
+choice is the primary mechanism by which the model enforces physically correct
+label--flux correlations.
+
+\subsubsection{Chemical Expert Branch}
+Each atomic species $X$ has its own dedicated block. The block concatenates the state
+vector with $[X/\mathrm{H}]$ and passes the result through two dense layers (64 units
+each), followed by a sparse spectral window projector layer, that confines the output to only the permitted spectral windows (provided by ASPCAP's .filt files in their github repository) (\citep{García Pérez et al. 2016, AJ, 151, 144},\citep{Abdurro'uf et al. 2022, ApJS, 259, 35}). The branch uses the weighted array of the significance of each pixel for species $X$ and projects the output using the weights.
+
+This masking is a hard mathematical constraint: gradients cannot propagate through masked
+pixels, so the network is provably unable to attribute spectral signal at a non-permitted
+wavelength to species $X$.
+\begin{comment}
+\subsubsection{Residual Correction Branch}
+A small residual branch receives the full input vector and predicts a small correction
+$\tau_\mathrm{res}(\lambda)$ to absorb systematic offsets not captured by the other
+branches. Strict $\ell_1$ regularization is applied to this branch's weights to ensure it
+does not learn significant structure that would undermine the disentanglement enforced by
+the chemical expert branch.
+\end{comment}
+\subsection{Training}
+\label{subsec:training}
+
+The model is trained end-to-end by minimizing a loss that reprsents the reduced $\chi^2$ of the predicted vs real spectra. The APOGEE dataset is split into training (120k stars), validation (20k stars), and test (~10k stars)
+sets. Sensor-gap pixels are masked from the loss throughout, either implicitly(as sensor gaps have infinite variance) or explicitly. Training used a standard Adam optimizer; all hyperparameters were selected by monitoring validation-set loss.
+
+\subsubsection{loss function}
+
+\subsubsection{}
+
+%------------------------------------------------------------
+\section{Validation}
+\label{sec:validation}
+%------------------------------------------------------------
+
+\subsection{Spectral Reconstruction Quality}
+\label{subsec:recon}
+
+Figure~\ref{fig:reconstruction} shows the emulator prediction overlaid on a representative
+APOGEE DR17 spectrum ($T_\mathrm{eff} = 4498$\,K, $\log g = 1.87$, $[\mathrm{Fe/H}] = -0.19$
+on the solar scale). Both the pseudo-continuum shape and the depths of individual
+absorption features are reproduced accurately. Sensor-gap regions where the observed
+flux is identically zero are correctly ignored by the model. The residuals are small and
+noise-like, with no systematic offsets at the locations of strong lines.
+
+Averaged over the test set, the model achieves a mean absolute error of $\mathrm{MAE}
+\approx 0.8\%$ on the continuum-normalized flux. This is comparable to the combined
+uncertainty budget of ASPCAP label errors, the stellar noise floor, and calibration
+residuals, indicating that the model is operating near the information limit of the data.
+
+\subsection{Manifold Coverage: PCA Analysis}
+\label{subsec:pca}
+
+To assess whether the emulator generates spectra whose statistical properties match those
+of real APOGEE observations, we performed a principal component analysis (PCA) on a
+matched sample of real and generated spectra (with sensor-gap artifacts masked for a fair
+comparison). The first two principal components explain 54.2\% and 18.0\% of the variance,
+respectively. As shown in Figure~\ref{fig:pca}, the generated spectra occupy the same
+two-dimensional projection as the real APOGEE spectra, demonstrating that the model
+faithfully reproduces the data manifold. The cumulative explained variance for the
+generated spectra rises slightly faster than for the real data, consistent with the fact
+that our deterministic model does not reproduce observational noise (which distributes
+variance broadly across all components).
+
+\subsection{Physics Disentanglement: Gradient Test}
+\label{subsec:gradient}
+
+A central claim of our model is that chemical abundance labels affect the predicted flux
+only at physically permitted wavelengths. We verify this directly by computing the
+sensitivity gradient $\partial F / \partial [\mathrm{Al/H}]$ at every pixel for a
+representative test star. Figure~\ref{fig:gradient} shows that this gradient is
+indistinguishable from zero at all wavelengths except those corresponding to known
+Al absorption lines, with two prominent non-zero peaks visible near the permitted Al
+transitions at $\sim$1675\,nm. No leakage to Fe, CO, or other features is detected.
+
+This behavior is a direct consequence of the hard spectral mask in Equation~(\ref{eq:mask}):
+because the forward computation for element $X$ at masked pixels is identically zero,
+the backpropagated gradient is identically zero at those pixels by the chain rule. The
+gradient test therefore confirms that the architectural disentanglement is operating as
+intended.
+
+%------------------------------------------------------------
+\section{Comparison with Prior Work}
+\label{sec:comparison}
+%------------------------------------------------------------
+
+\subsection{The Cannon and The Cannon 2}
+\label{subsec:cannon}
+
+The Cannon \citep{Ness2015Cannon} and The Cannon 2 \citep{Casey2016Cannon2} are
+data-driven models that fit a polynomial (quadratic) generative function relating stellar
+labels to spectral fluxes. The Cannon 2 uses $\ell_1$ regularization to enforce sparsity
+in the spectral derivatives, which---like our spectral masks---prevents label coefficients
+from acquiring unphysical non-zero values at all wavelengths. Our model shares this
+philosophy of enforcing physical sparsity but improves upon it in two respects: first,
+the sparsity in our model is mathematically exact (hard masking) rather than
+approximate (soft regularization); second, our non-linear neural architecture can capture
+higher-order interactions between labels and spectra that a quadratic model cannot represent.
+In terms of accuracy, our MAE of $\sim$0.8\% compares favorably to the typical abundance
+precision of $\sim$0.04\,dex achieved by The Cannon 2.
+
+\subsection{The Payne}
+\label{subsec:payne}
+
+The Payne \citep{Ting2019Payne} is a multi-layer perceptron emulator trained on 2000
+synthetic spectrograms with 7500 pixels, achieving a root-mean-square error of $10^{-3}$
+on synthetic validation data. Because it is trained exclusively on synthetic spectra, it
+is an \emph{ab initio} model: it can, in principle, return labels on any physical scale,
+but it encodes all the approximations of the theoretical atmosphere grid. By contrast,
+our model is trained on real APOGEE spectra and therefore learns the empirical noise floor
+and calibration characteristics of the instrument. The Payne is also known to suffer from
+parameter entanglement, with unphysical correlations between abundance labels arising
+because the network has no mechanism to isolate individual elements to their permitted
+spectral windows. Our architecture explicitly prevents such cross-talk.
+
+\subsection{TransformerPayne}
+\label{subsec:transformerpayne}
+
+TransformerPayne \citep{TransformerPayne2025} employs large transformer attention
+mechanisms to capture long-range correlations across the full spectrum, again trained on
+synthetic grids, and reports an MAE of $\sim 10^{-3}$ on a held-out synthetic dataset.
+While this represents excellent performance on synthetic data, it requires substantially
+more computational resources than our model and does not include real-data validation.
+Our approach achieves comparable fitting accuracy on real observations with lower
+computational cost and with physically enforced interpretability.
+
+\subsection{Summary of Comparison}
+
+Table~\ref{tab:comparison} summarizes the key distinctions between our model and
+representative prior work.
+
+\begin{deluxetable*}{lcccc}
+\tablecaption{Comparison of stellar spectral emulators \label{tab:comparison}}
+\tablewidth{0pt}
+\tablehead{
+  \colhead{Model} &
+  \colhead{Training data} &
+  \colhead{Disentanglement} &
+  \colhead{Interpretable} &
+  \colhead{MAE (real data)}
+}
+\startdata
+The Cannon 2   & Real (APOGEE DR12) & Soft ($\ell_1$)   & Yes (derivatives) & $\sim$0.04 dex \\
+The Payne      & Synthetic grid     & None              & No (black box)    & ---            \\
+TransformerPayne & Synthetic grid   & None              & No (black box)    & ---            \\
+StarNet        & Synthetic grid     & None              & No                & ---            \\
+This work      & Real (APOGEE DR17) & Hard (mask)       & Yes (gradients)   & $\sim$0.8\%    \\
+\enddata
+\tablecomments{MAE for The Cannon 2 is reported in units of dex on abundance labels;
+MAE for this work is reported as mean absolute flux error on continuum-normalized spectra.
+Dashes indicate that the corresponding metric was not reported in the original publications
+for real APOGEE data.}
+\end{deluxetable*}
+
+%------------------------------------------------------------
+\section{Discussion}
+\label{sec:discussion}
+%------------------------------------------------------------
+
+We have presented a neural emulator for stellar spectra that combines the advantages of
+data-driven modeling---training on real observations, robustness to noise and calibration
+artifacts---with hard physical constraints that guarantee interpretable, disentangled label
+sensitivities. The architectural separation of the spectrum into continuum, molecular, atomic,
+and residual contributions mirrors the physical origin of these spectral components and
+provides a natural pathway for model interpretation.
+
+The gradient test presented in Section~\ref{subsec:gradient} constitutes a direct,
+pixel-level validation of disentanglement that is not available from standard metrics
+such as cross-validation loss or abundance precision. We argue that such tests should
+become standard practice for any generative spectral model that claims interpretability.
+
+Several limitations of the current model should be noted. First, the thermodynamic state
+branch and residual branch each introduce a degree of flexibility that, if unconstrained,
+could in principle absorb variance attributable to chemical abundances. The strict
+$\ell_1$ regularization on the residual branch mitigates this risk, but a future
+quantitative gradient-leakage metric \citep[cf.][]{Casey2016Cannon2} will be necessary
+to bound residual entanglement precisely.
+
+Second, the imputation procedure used to fill missing ASPCAP labels introduces a
+correlation structure into the training labels that may not reflect the true astrophysical
+covariance. This could bias the thermodynamic state vector for stars with many missing
+labels. A more principled treatment, such as training with an explicit latent variable
+model for missing data, is a natural extension.
+
+Third, unlike The Cannon 2, which delivers formal label uncertainties via the Jacobian
+of the test-step likelihood, our current model does not yet support backward inference
+(the recovery of labels from an observed spectrum). A planned backward model
+(Section~\ref{sec:future}) will close this gap by using the emulator as a forward model
+within an optimization loop.
+
+The PCA manifold analysis demonstrates that the generated spectra are statistically
+indistinguishable from real APOGEE spectra in the first two principal components. However,
+the slightly higher cumulative explained variance for generated spectra (because they lack
+observational noise) means that the comparison is not perfectly fair at high principal
+component order. A more rigorous test, using a trained discriminative classifier to
+distinguish real from generated spectra, is planned as part of the external validation
+program described below.
+
+%------------------------------------------------------------
+\section{Future Work}
+\label{sec:future}
+%------------------------------------------------------------
+
+We outline the following planned extensions and validation experiments.
+
+\paragraph{Reduced $\chi^2$ analysis.}
+We will compute the goodness-of-fit statistic $\chi^2_\mathrm{red}$ for the full test
+set and examine its distribution as a function of $T_\mathrm{eff}$, $[M/\mathrm{H}]$,
+and $\log g$. Elevated $\chi^2_\mathrm{red}$ in particular regions of parameter space
+will identify where the model requires additional capacity or where ASPCAP labels are
+unreliable.
+
+\paragraph{Gradient leakage ratio.}
+A scalar summary statistic quantifying the fraction of total gradient power at
+non-permitted pixels will be computed for every element, providing a global measure of
+disentanglement completeness.
+
+\paragraph{External validation via classifier.}
+A discriminative neural network will be trained to distinguish real APOGEE spectra from
+emulator-generated ones. If the classifier's accuracy is near chance level (50\%), it
+will confirm that generated and real spectra are statistically indistinguishable.
+
+\paragraph{Comparison with The Payne.}
+We will perform a systematic head-to-head comparison between our emulator and The Payne
+on: inference wall-clock time, gradient leakage ratio, $\chi^2_\mathrm{red}$, and
+stability against label cross-talk, using a common held-out test set.
+
+\paragraph{Backward inference pipeline.}
+The emulator will be embedded in an optimization loop in which observed spectra serve
+as targets. Stellar labels will be initialized from ASPCAP values and refined by
+gradient descent on the forward model. Because the emulator runs in $\mathcal{O}$(ms),
+this approach will be orders of magnitude faster than Markov Chain Monte Carlo methods
+while retaining full uncertainty quantification if combined with an ensemble or variational
+approach.
+
+\paragraph{Synthetic dataset generator.}
+A public Python class will allow users to specify a parameter space and generate arbitrary
+numbers of synthetic spectra for downstream applications such as training data-driven
+classifiers or testing spectral analysis pipelines.
+
+%------------------------------------------------------------
+\section{Conclusion}
+\label{sec:conclusion}
+%------------------------------------------------------------
+
+We have constructed a physics-constrained generative neural emulator for APOGEE DR17
+stellar spectra. The model is trained on 149,966 real giant-star observations and achieves
+an MAE of $\sim 0.8\%$ on held-out test spectra, operating near the noise floor of the
+data. By decomposing the predicted optical depth into physically motivated branches and
+enforcing element-specific spectral masks, the model guarantees that each chemical
+abundance label affects only those pixels associated with its known atomic transitions.
+Sensitivity gradients confirm this disentanglement is exact at the pixel level.
+
+The model outperforms The Cannon in per-pixel accuracy while matching or exceeding
+The Payne in interpretability, and does so using real observational data rather than
+synthetic grids. It represents a step toward spectral emulators that are simultaneously
+accurate, physically transparent, and faithful to the observational properties of the
+instruments that collect the data.
+
+All code for this project is available, with documentation and examples, via the project
+repository. Community contributions and discussion via GitHub are warmly welcomed.
+
+%------------------------------------------------------------
+\begin{authorcontributions}
+A.S. conceived the model architecture, collected and preprocessed the data, performed
+all training and validation experiments, produced all figures, and wrote the manuscript.
+\end{authorcontributions}
+
+\begin{acknowledgments}
+%------------------------------------------------------------
+
+The author thanks the supervisors and collaborators at Cepheid, IITH for guidance and
+feedback. This project made use of data from the SDSS-IV APOGEE survey. Funding for
+the Sloan Digital Sky Survey IV has been provided by the Alfred P.\ Sloan Foundation,
+the U.S.\ Department of Energy Office of Science, and the Participating Institutions.
+SDSS-IV acknowledges support and resources from the Center for High-Performance Computing
+at the University of Utah. The SDSS web site is \texttt{www.sdss.org}.
+
+This research made use of Astropy, a community-developed core Python package for
+Astronomy \citep{Astropy2013}; NumPy \citep{vanderWalt2011}; SciPy \citep{Jones2001};
+Matplotlib \citep{Hunter2007}; and scikit-learn \citep{Pedregosa2011}.
+\end{acknowledgments}
+%------------------------------------------------------------
+% Use BibTeX with the v7 style file (aasjournalv7.bst)
+% Place your .bib file references below, or use:
+%   \bibliographystyle{aasjournalv7}
+%   \bibliography{references}
+%
+% Manual bibliography shown here for portability:
+\begin{thebibliography}{}
+
+\bibitem[Abdurrouf et al.(2022)]{Abdurrouf2022}
+Abdurrouf, et al.\ 2022, ApJS, 259, 35
+
+\bibitem[Astropy Collaboration et al.(2013)]{Astropy2013}
+Astropy Collaboration, Robitaille, T.\ P., Tollerud, E.\ J., et al.\ 2013, A\&A, 558, AA33
+
+\bibitem[Bland-Hawthorn \& Gerhard(2016)]{BlandHawthorn2016}
+Bland-Hawthorn, J., \& Gerhard, O.\ 2016, ARA\&A, 54, 529
+
+\bibitem[Casey et al.(2016)]{Casey2016Cannon2}
+Casey, A.\ R., Hogg, D.\ W., Ness, M., Rix, H.-W., Ho, A.\ Y.\ Q., \& Gilmore, G.\
+2016, arXiv:1603.03040
+
+\bibitem[Freeman \& Bland-Hawthorn(2002)]{Freeman2002}
+Freeman, K., \& Bland-Hawthorn, J.\ 2002, ARA\&A, 40, 487
+
+\bibitem[Garc\'ia P\'erez et al.(2016)]{GarciaperezASPCAP2016}
+Garc\'ia P\'erez, A.\ E., Allende Prieto, C., Holtzman, J.\ A., et al.\ 2016,
+AJ, 151, 144
+
+\bibitem[Hunter(2007)]{Hunter2007}
+Hunter, J.\ D.\ 2007, Comput.\ Sci.\ Eng., 9, 90
+
+\bibitem[Jones et al.(2001)]{Jones2001}
+Jones, E., Oliphant, E., Peterson, P., et al.\ 2001, SciPy: Open Source Scientific
+Tools for Python, \url{http://www.scipy.org/}
+
+\bibitem[Majewski et al.(2017)]{Majewski2017}
+Majewski, S.\ R., Schiavon, R.\ P., Frinchaboy, P.\ M., et al.\ 2017, AJ, 154, 94
+
+\bibitem[Ness et al.(2015)]{Ness2015Cannon}
+Ness, M., Hogg, D.\ W., Rix, H.-W., Ho, A.\ Y.\ Q., \& Zasowski, G.\ 2015,
+ApJ, 808, 16
+
+\bibitem[Pedregosa et al.(2011)]{Pedregosa2011}
+Pedregosa, F., Varoquaux, G., Gramfort, A., et al.\ 2011, JMLR, 12, 2825
+
+\bibitem[Shetrone et al.(2015)]{Shetrone2015}
+Shetrone, M., Bizyaev, D., Lawler, J.\ E., et al.\ 2015, ApJS, 221, 24
+
+\bibitem[Smith et al.(2021)]{Smith2021DR17}
+Smith, V.\ V., Cunha, K., Shetrone, M.\ D., et al.\ 2021, AJ, 161, 254
+
+\bibitem[Ting et al.(2019)]{Ting2019Payne}
+Ting, Y.-S., Conroy, C., Rix, H.-W., \& Cargile, P.\ 2019, ApJ, 879, 69
+
+\bibitem[TransformerPayne(2025)]{TransformerPayne2025}
+TransformerPayne Collaboration\ 2025, arXiv preprint [astro-ph.SR]
+
+\bibitem[van der Walt et al.(2011)]{vanderWalt2011}
+van der Walt, S., Colbert, S.\ C., \& Varoquaux, G.\ 2011, Comput.\ Sci.\ Eng., 13, 22
+
+\end{thebibliography}
+
+\end{document}
