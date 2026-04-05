@@ -1,20 +1,5 @@
-# FULL REWRITE OF BACKWARD-MODEL PIPELINE (V5 - CLEANEST)
-# Copy this script into a clean cell in your notebook.
-
-"""
-backward_model_map.py — Tier 1: Batched MAP Optimization (fastest)
-==================================================================
-Pure gradient-descent point estimates using Adam, fully XLA-compiled.
-No posterior uncertainties — just the maximum a posteriori (MAP) estimate.
-
-Two-stage FERRE-style:
-  Stage 1 — 9D core physics via batched Adam on full spectrum
-  Stage 2 — 14 × 1D individual abundances via batched Adam on masked pixels
-
-CNN warm-start provides initialisation + Gaussian prior (regulariser).
-
-~50–100× faster than NUTS. Run on Kaggle with GPU enabled.
-"""
+# FULL INTEGRATION OF BACKWARD-MODEL PIPELINE (V6 - FINAL VERIFIED)
+# This script combines the notebook base with Laplace Uncertainty Estimation.
 
 import os
 import time
@@ -25,14 +10,60 @@ import tensorflow as tf
 import tensorflow_probability as tfp
 from tensorflow.keras.saving import register_keras_serializable
 from tensorflow.keras import layers
-from sklearn.experimental import enable_iterative_imputer   # noqa
+import matplotlib.pyplot as plt
+from sklearn.experimental import enable_iterative_imputer
 from sklearn.impute import IterativeImputer
 from sklearn.linear_model import BayesianRidge
 
+tfb = tfp.bijectors
 
-# ============================================================================
-#  LAPLACE UNCERTAINTY ESTIMATION (Stage 1, Stage 2, Joint)
-# ============================================================================
+# ================================================================
+# 1. CONFIGURATION
+# ================================================================
+
+class Config:
+    H5_PATH    = "/kaggle/input/datasets/aneeshshastri/aspcapstar-dr17-150kstars/apogee_dr17_parallel.h5"
+    STATS_PATH = "/kaggle/working/dataset_stats.npz"
+    SELECTED_LABELS = [
+        'TEFF', 'LOGG', 'M_H', 'VMICRO', 'VMACRO', 'VSINI',
+        'C_FE', 'N_FE', 'O_FE', 'FE_H',
+        'MG_FE', 'SI_FE', 'CA_FE', 'TI_FE', 'S_FE',
+        'AL_FE', 'MN_FE', 'NI_FE', 'CR_FE', 'K_FE',
+        'NA_FE', 'V_FE', 'CO_FE',
+    ]
+    N_LABELS_RAW = len(SELECTED_LABELS)
+    BADPIX_CUTOFF = 1e-3
+    RANDOM_SEED   = 42
+    BATCH_SIZE_STARS = 32
+    PRIOR_WEIGHT = 1.0
+
+config = Config()
+np.random.seed(config.RANDOM_SEED)
+tf.random.set_seed(config.RANDOM_SEED)
+
+CORE_INDICES  = [0,1,2,3,4,5,6,7,8]
+ABUND_INDICES = [i for i in range(23) if i not in CORE_INDICES]
+
+# ================================================================
+# 2. CUSTOM LAYERS
+# ================================================================
+
+@register_keras_serializable()
+class ColumnSelector(layers.Layer):
+    def __init__(self, indices, **kwargs):
+        super().__init__(**kwargs)
+        self.indices = list(indices)
+    def call(self, inputs): return tf.gather(inputs, self.indices, axis=1)
+    def get_config(self): c = super().get_config(); c.update({'indices': self.indices}); return c
+
+@register_keras_serializable()
+class BeerLambertLaw(layers.Layer):
+    def __init__(self, **kwargs): super().__init__(**kwargs)
+    def call(self, k, tau): return k * tf.math.exp(-tau)
+
+# ================================================================
+# 3. LAPLACE UNCERTAINTY ESTIMATION
+# ================================================================
 
 @tf.function(jit_compile=True)
 def compute_uncertainties_core(theta_unc_batch, obs_flux, obs_ivar, fixed_abund, cnn_mu, cnn_std):
@@ -110,1859 +141,162 @@ def compute_uncertainties_joint(theta_unc_batch, obs_flux, obs_ivar, cnn_mu, cnn
         return tf.sqrt(var) * jac
     return tf.vectorized_map(single_star_hessian, (theta_unc_batch, obs_flux, obs_ivar, cnn_mu, cnn_std))
 
+# ================================================================
+# 4. ENRICHED REPORTING
+# ================================================================
+
 def report_map_results_enriched(results):
     trues = np.array(results['true_labels'])
     preds = np.array(results['inferred_labels'])
     errors = np.array(results['inferred_errors'])
     aspcap_err = np.array(results['aspcap_errors'])
     residuals = preds - trues
-    header_sep = "─" * 80
-    print(f"
-  PRISM Enriched MAP Diagnostics
-  {header_sep}")
+    h = "─" * 80
+    print(f"\n  PRISM Enriched MAP Diagnostics\n  {h}")
     print(f"  {'Label':<12} {'Bias':>8} {'MAD':>8} {'RMSE':>8} {'Mod-σ':>8} {'Ratio':>6}")
-    print(f"  {header_sep}")
+    print(f"  {h}")
     for j, name in enumerate(config.SELECTED_LABELS):
         r, m_sig, a_sig = residuals[:, j], errors[:, j], aspcap_err[:, j]
         bias = np.median(r); mad = np.median(np.abs(r - bias)); rmse = np.sqrt(np.mean(r**2))
         avg_ie = np.sqrt(np.mean(m_sig**2)); ratio = np.median(a_sig / np.where(m_sig>1e-10, m_sig, 1e-10))
         print(f"  {name:<12} {bias:>8.3f} {mad:>8.3f} {rmse:>8.3f} {avg_ie:>8.3f} {ratio:>6.1f}x")
-    print(f"  {header_sep}")
-
-tfb = tfp.bijectors
+    print(f"  {h}")
 
 # ================================================================
-# CONFIG (identical to backward_model_hmc.py)
+# 5. MODIFIED INFERENCE PIPELINES
 # ================================================================
 
-class Config:
-    H5_PATH    = "/kaggle/input/datasets/aneeshshastri/aspcapstar-dr17-150kstars/apogee_dr17_parallel.h5"
-    TFREC_DIR  = "/kaggle/working/tfrecords"
-    STATS_PATH = "/kaggle/working/dataset_stats.npz"
-    start = 140_000
-    end   = 149_500
-    TESTING_MODE  = True
-    RANDOM_SEED   = 42
-    OUTPUT_LENGTH = 8575
-    BADPIX_CUTOFF = 1e-3
-    SELECTED_LABELS = [
-        'TEFF', 'LOGG', 'M_H', 'VMICRO', 'VMACRO', 'VSINI',
-        'C_FE', 'N_FE', 'O_FE',
-        'FE_H',
-        'MG_FE', 'SI_FE', 'CA_FE', 'TI_FE', 'S_FE',
-        'AL_FE', 'MN_FE', 'NI_FE', 'CR_FE', 'K_FE',
-        'NA_FE', 'V_FE', 'CO_FE',
-    ]
-    ABUNDANCE_INDICES = [i for i, l in enumerate(SELECTED_LABELS) if '_FE' in l]
-    FE_H_INDEX = SELECTED_LABELS.index('FE_H')
-    N_LABELS   = len(SELECTED_LABELS) + 4
-    ERRORS     = [f'{l}_ERR' for l in SELECTED_LABELS]
-
-config = Config()
-np.random.seed(config.RANDOM_SEED)
-tf.random.set_seed(config.RANDOM_SEED)
-
-# ================================================================
-# CUSTOM LAYERS (needed for model loading — identical to HMC file)
-# ================================================================
-
-# --- CELL SEPARATOR ---
-
-
-@register_keras_serializable()
-def chi2_estimate(y_true,y_pred):
-    y_true=tf.cast(y_true,tf.float32)
-    y_pred=tf.cast(y_pred,tf.float32)
-    if len(y_pred.shape) == 2:
-        y_pred = tf.expand_dims(y_pred, -1)
-    real_flux = y_true[:, :, 0:1]
-    ivar = y_true[:, :, 1:2]
-    valid_mask = tf.cast(real_flux > config.BADPIX_CUTOFF, tf.float32)    
-    safe_flux = tf.where(valid_mask == 1.0, real_flux, y_pred)
-    #ivar_safe = ivar/(config.IVAR_SCALE+ivar)# scale and soft 
-    weight=ivar
-    weight=tf.where(ivar>0,weight,0.0)#weight=tf.where(((safe_flux<0.9) & (ivar>0)),tf.maximum(ivar_safe,tf.cast(1.0,dtype=tf.float32)),ivar_safe)
-    #chi2
-    wmse_term = tf.square(safe_flux - y_pred) * weight * valid_mask
-    n_valid_pixels = tf.reduce_sum(valid_mask, 1)
-    n_params = len(config.SELECTED_LABELS)
-    dof = n_valid_pixels - n_params
-    return tf.reduce_sum(wmse_term,1)/dof
-
-
-@register_keras_serializable()
-def spl_loss(y_true, y_pred):
-    if len(y_pred.shape) == 2:
-        y_pred = tf.expand_dims(y_pred, -1)
-    real_flux = y_true[:, :, 0:1]
-    ivar = y_true[:, :, 1:2]
-    valid_mask = tf.cast(real_flux > config.BADPIX_CUTOFF, tf.float32)    
-    safe_flux = tf.where(valid_mask == 1.0, real_flux, y_pred)
-    #ivar_safe = ivar/(config.IVAR_SCALE+ivar)# scale and soft 
-    weight=1e-5/(1/ivar+1e-5)
-    weight=tf.where(ivar>0,weight,0.0)#weight=tf.where(((safe_flux<0.9) & (ivar>0)),tf.maximum(ivar_safe,tf.cast(1.0,dtype=tf.float32)),ivar_safe)
-    #chi2
-    wmse_term = tf.square(safe_flux - y_pred) * weight * valid_mask
-    
-    loss = tf.where(tf.math.is_finite(wmse_term), wmse_term, tf.zeros_like(wmse_term))
-    
-    return loss
-
-@register_keras_serializable()
-class ColumnSelector(layers.Layer):
-    def __init__(self, indices, **kwargs):
-        super().__init__(**kwargs)
-        self.indices = list(indices)
-    def call(self, inputs):
-        return tf.gather(inputs, self.indices, axis=1)
-    def get_config(self):
-        c = super().get_config(); c['indices'] = self.indices; return c
-
-@register_keras_serializable()
-class BeerLambertLaw(layers.Layer):
-    def __init__(self, **kwargs): super().__init__(**kwargs)
-    def call(self, k, tau): return k * tf.math.exp(-tau)
-
-@register_keras_serializable()
-class GetAbundances(layers.Layer):
-    def __init__(self, col_id, **kwargs):
-        super().__init__(**kwargs)
-        self.index = col_id
-    def call(self, inputs):
-        return inputs[:, self.index:self.index+1]
-    def get_config(self):
-        c = super().get_config(); c['col_id'] = self.index; return c
-
-@register_keras_serializable()
-class SparseProjector(tf.keras.layers.Layer):
-    def __init__(self, active_indices, weights, total_pixels, label_name="unknown", **kwargs):
-        kwargs['name'] = f"Sparse_Projector_{label_name}"
-        super().__init__(**kwargs)
-        self.total_pixels = total_pixels
-        self.label_name = label_name
-        self.active_indices = tf.constant(active_indices, dtype=tf.int32)
-        self.weights_tensor = tf.constant(weights, dtype=tf.float32)
-    def call(self, local_tau):
-        local_tau_32 = tf.cast(local_tau, tf.float32)
-        weighted = local_tau_32 * self.weights_tensor[None, :]
-        batch_size = tf.shape(local_tau)[0]
-        n_active = tf.shape(self.active_indices)[0]
-        batch_ids = tf.repeat(tf.range(batch_size), n_active)
-        pixel_ids = tf.tile(self.active_indices, tf.expand_dims(batch_size, axis=0))
-        scatter_idx = tf.stack([batch_ids, pixel_ids], axis=-1)
-        return tf.scatter_nd(scatter_idx, tf.reshape(weighted, [-1]),
-                             shape=tf.stack([batch_size, tf.constant(self.total_pixels, dtype=tf.int32)]))
-    def compute_output_shape(self, input_shape):
-        return (input_shape[0], self.total_pixels)
-    def get_config(self):
-        c = super().get_config()
-        c.update({'active_indices': self.active_indices.numpy().tolist(),
-                  'weights': self.weights_tensor.numpy().tolist(),
-                  'total_pixels': self.total_pixels, 'label_name': self.label_name})
-        return c
-    @classmethod
-    def from_config(cls, cfg):
-        cfg['active_indices'] = np.array(cfg['active_indices'], dtype=np.int32)
-        cfg['weights'] = np.array(cfg['weights'], dtype=np.float32)
-        cfg.pop('name', None)
-        return cls(**cfg)
-
-N_LABELS_RAW = 23
-N_PIXELS     = 8575
-
-@register_keras_serializable()
-class HeteroscedasticCNNPredictor(tf.keras.Model):
-    def __init__(self, n_labels=N_LABELS_RAW, **kwargs):
-        super().__init__(**kwargs)
-        self.n_labels = n_labels
-        self.reshape_in = layers.Reshape((N_PIXELS, 1))
-        self.conv1 = layers.Conv1D(32, 16, strides=4, activation='relu', padding='same')
-        self.bn1 = layers.BatchNormalization()
-        self.conv2 = layers.Conv1D(64, 8, strides=4, activation='relu', padding='same')
-        self.bn2 = layers.BatchNormalization()
-        self.conv3 = layers.Conv1D(128, 4, strides=2, activation='relu', padding='same')
-        self.bn3 = layers.BatchNormalization()
-        self.conv4 = layers.Conv1D(256, 4, strides=2, activation='relu', padding='same')
-        self.bn4 = layers.BatchNormalization()
-        self.gap = layers.GlobalAveragePooling1D()
-        self.dense1 = layers.Dense(512, activation='relu')
-        self.drop1 = layers.Dropout(0.3)
-        self.dense2 = layers.Dense(256, activation='relu')
-        self.drop2 = layers.Dropout(0.2)
-        self.mean_head = layers.Dense(n_labels, name='label_mean')
-        self.log_var_head = layers.Dense(n_labels, name='label_log_var')
-    def call(self, x, training=False):
-        h = self.reshape_in(x)
-        h = self.bn1(self.conv1(h), training=training)
-        h = self.bn2(self.conv2(h), training=training)
-        h = self.bn3(self.conv3(h), training=training)
-        h = self.bn4(self.conv4(h), training=training)
-        h = self.gap(h)
-        h = self.drop1(self.dense1(h), training=training)
-        h = self.drop2(self.dense2(h), training=training)
-        return self.mean_head(h), self.log_var_head(h)
-    def get_config(self):
-        c = super().get_config(); c['n_labels'] = self.n_labels; return c
-
-@register_keras_serializable()
-class TrainableCNNPredictor(HeteroscedasticCNNPredictor):
-    pass
-
-# ================================================================
-# DATA LOADING (same as HMC file)
-# ================================================================
-
-def get_clean_imputed_data(h5_path, selected_labels, limit=None):
-    with h5py.File(h5_path, 'r') as f:
-        get_col = lambda k: f['metadata'][k]
-        keys = f['metadata'].dtype.names
-        raw_values = np.stack([get_col(p) for p in selected_labels], axis=1)
-        bad_mask = np.zeros_like(raw_values, dtype=bool)
-        for i, label in enumerate(selected_labels):
-            flag_name = f"{label}_FLAG"
-            if flag_name in keys:
-                flg = get_col(flag_name)
-                if flg.dtype.names: flg = flg[flg.dtype.names[0]]
-                if flg.dtype.kind == 'V': flg = flg.view('<i4')
-                bad_mask[:, i] = (flg.astype(int) != 0)
-            elif label in ['TEFF', 'LOGG', 'VMICRO', 'VMACRO', 'VSINI']:
-                bad_mask[:, i] = (raw_values[:, i] < -5000)
-    if limit:
-        raw_values = raw_values[:limit]; bad_mask = bad_mask[:limit]
-    vals = raw_values.copy(); vals[bad_mask] = np.nan
-    imputer = IterativeImputer(estimator=BayesianRidge(), max_iter=10, initial_strategy='median')
-    clean = imputer.fit_transform(vals)
-    fe_h = clean[:, config.FE_H_INDEX:config.FE_H_INDEX+1]
-    for idx in config.ABUNDANCE_INDICES: clean[:, idx] += fe_h[:, 0]
-    t = clean[:, selected_labels.index('TEFF')]
-    clean = np.hstack([clean, (5040.0/(t+1e-6)).reshape(-1,1)])
-    vm = clean[:, selected_labels.index('VMACRO')]
-    vs = clean[:, selected_labels.index('VSINI')]
-    clean = np.hstack([clean, np.sqrt(vm**2+vs**2).reshape(-1,1)])
-    c = clean[:, selected_labels.index('C_FE')]
-    o = clean[:, selected_labels.index('O_FE')]
-    clean = np.hstack([clean, (c-o).reshape(-1,1)])
-    g = clean[:, selected_labels.index('LOGG')]
-    m = clean[:, selected_labels.index('M_H')]
-    clean = np.hstack([clean, (0.5*g+0.5*m).reshape(-1,1)])
-    return clean
-
-def get_err(h5_path, selected_labels, limit=None):
-    with h5py.File(h5_path, 'r') as f:
-        get_col = lambda k: f['metadata'][k]
-        keys = f['metadata'].dtype.names
-        raw = np.stack([get_col(p) if p not in ['VMACRO_ERR','VMICRO_ERR','VSINI_ERR']
-                        else np.zeros_like(get_col('TEFF_ERR')) for p in selected_labels], axis=1)
-        bad = np.zeros_like(raw, dtype=bool)
-        for i, l in enumerate(selected_labels):
-            fn = f"{l}_FLAG"
-            if fn in keys:
-                flg = get_col(fn)
-                if flg.dtype.names: flg = flg[flg.dtype.names[0]]
-                if flg.dtype.kind == 'V': flg = flg.view('<i4')
-                bad[:, i] = (flg.astype(int) != 0)
-            elif l in ['TEFF','LOGG','VMICRO','VMACRO','VSINI']:
-                bad[:, i] = (raw[:, i] < -5000)
-        if limit: raw = raw[:limit]; bad = bad[:limit]
-    v = raw.copy(); v[bad] = np.nan
-    p95 = np.nanpercentile(v, 95, axis=0)
-    return np.where(np.isnan(v), p95, v)
-
-# ================================================================
-# LOAD DATA + MODELS
-# ================================================================
-
-print("Loading data...")
-h5_path    = config.H5_PATH
-stats_path = "/kaggle/input/models/aneeshshastri/stargen-comparision/tensorflow2/default/15/dataset_stats_120k.npz"
-model_path = "/kaggle/input/models/aneeshshastri/stargen-comparision/tensorflow2/default/15/ThePayne.keras"
-cnn_model_path = "/kaggle/input/models/aneeshshastri/backward-warmstart/tensorflow2/default/1/cnn_label_predictor_inner (1).keras"
-cnn_stats_path = "/kaggle/input/models/aneeshshastri/backward-warmstart/tensorflow2/default/1/cnn_label_stats.npz"
-apogee_mask_path = "/kaggle/input/datasets/aneeshshastri/element-masks/apogee_inference_mask.npy"
-
-with h5py.File(h5_path, 'r') as f:
-    real_data      = f['flux'][config.start:config.end]
-    real_data_ivar = f['ivar'][config.start:config.end]
-
-with np.load(stats_path) as data:
-    MEAN_TENSOR = data['mean'].astype(np.float32)
-    STD_TENSOR  = data['std'].astype(np.float32)
-
-labels    = get_clean_imputed_data(h5_path, config.SELECTED_LABELS)
-label_err = get_err(h5_path, config.ERRORS)[config.start:config.end]
-labels    = ((labels - MEAN_TENSOR) / STD_TENSOR)[config.start:config.end]
-
-model_raw = tf.keras.models.load_model(model_path)
-cfg_m = model_raw.get_config()
-cfg_str = json.dumps(cfg_m).replace('"float16"', '"float32"').replace('"mixed_float16"', '"float32"')
-model_pure_fp32 = model_raw.__class__.from_config(json.loads(cfg_str))
-model_pure_fp32.set_weights(model_raw.get_weights())
-print("Forward model rebuilt in FP32.")
-
-cnn_predictor = tf.keras.models.load_model(cnn_model_path)
-with np.load(cnn_stats_path) as cs:
-    CNN_LABEL_MEAN = cs['mean'].astype(np.float32)
-    CNN_LABEL_STD  = cs['std'].astype(np.float32)
-
-def cnn_predict_physical(flux_batch):
-    fc = flux_batch.copy(); bad = ~np.isfinite(fc) | (fc <= 1e-3); fc[bad] = 1.0
-    mu_n, rlv = cnn_predictor(tf.constant(fc, tf.float32), training=False)
-    mu_p = mu_n.numpy() * CNN_LABEL_STD + CNN_LABEL_MEAN
-    std_p = np.sqrt(tf.nn.softplus(rlv).numpy() + 1e-4) * CNN_LABEL_STD
-    std_p = np.maximum(std_p, 0.01 * CNN_LABEL_STD)
-    return mu_p.astype(np.float32), std_p.astype(np.float32)
-
-# ================================================================
-# CONSTANTS
-# ================================================================
-
-LABEL_NAMES  = config.SELECTED_LABELS
-BATCH_SIZE_STARS = 32   # MAP is cheap — batch larger
-TOTAL_STARS      = 500
-
-CORE_INDICES  = [0,1,2,3,4,5,6,7,8]
-N_CORE        = len(CORE_INDICES)
-ABUND_INDICES = [9,10,11,12,13,14,15,16,17,18,19,20,21,22]
-N_ABUND       = len(ABUND_INDICES)
-
-# MAP hyper-params
-N_STEPS_CORE = 1200
-N_STEPS_ELEM = 400
-LR_CORE_INIT = 0.03
-LR_CORE_END = 1e-4
-LR_ELEM_INIT = 0.03
-LR_ELEM_END = 1e-4
-PRIOR_WEIGHT = 1.0
-
-RESULTS_DIR     = "/kaggle/working/map_results"
-os.makedirs(RESULTS_DIR, exist_ok=True)
-CHECKPOINT_PATH = os.path.join(RESULTS_DIR, "checkpoint.npz")
-RESULTS_PATH    = os.path.join(RESULTS_DIR, "results.npz")
-
-lower_bounds = [3000.,-0.5,-2.5,0.,0.,-20.,-2.5,-2.5,-2.5,-2.5,-2.0,-1.5,-1.5,-2.0,-2.0,-2.0,-2.0,-2.0,-2.5,-2.0,-2.0,-2.0,-2.0]
-upper_bounds = [25000.,6.0,2.0,6.0,25.0,150.0,3.0,4.0,3.0,3.0,3.0,3.0,3.0,3.0,3.0,3.0,3.0,3.0,3.0,4.0,5.0,3.0,4.0]
-bounds_low  = tf.constant(lower_bounds, tf.float32)
-bounds_high = tf.constant(upper_bounds, tf.float32)
-
-_core_low  = tf.gather(bounds_low, CORE_INDICES)
-_core_high = tf.gather(bounds_high, CORE_INDICES)
-_core_bij  = tfb.Chain([tfb.Shift(_core_low), tfb.Scale(_core_high - _core_low), tfb.Sigmoid()])
-_core_inv  = tfb.Invert(_core_bij)
-
-_raw_mask = np.load(apogee_mask_path)
-ELEMENT_PIXEL_MASKS = {}
-for idx in ABUND_INDICES:
-    s = (_raw_mask[:, idx] > 0.01).astype(np.float32)
-    if s.sum() < 10: s = np.ones(N_PIXELS, np.float32)
-    ELEMENT_PIXEL_MASKS[idx] = tf.constant(s, tf.float32)
-
-N_REFERENCE_PIXELS = 500.0   # tune this — roughly the pixel count for Mg or Si
-ELEMENT_PRIOR_WEIGHTS = {}
-for idx in ABUND_INDICES:
-    n_pix = float(ELEMENT_PIXEL_MASKS[idx].numpy().sum())
-    pw = N_REFERENCE_PIXELS / max(n_pix, 10.0)
-    pw = np.clip(pw, 0.1, 20.0)          # safety clamp
-    ELEMENT_PRIOR_WEIGHTS[idx] = tf.constant(pw, tf.float32)
-
-# ================================================================
-# FEATURE ENGINEERING
-# ================================================================
-
-def get_27_features(labels_23):
-    teff   = labels_23[:, config.SELECTED_LABELS.index('TEFF')]
-    logg   = labels_23[:, config.SELECTED_LABELS.index('LOGG')]
-    vmacro = labels_23[:, config.SELECTED_LABELS.index('VMACRO')]
-    vsini  = labels_23[:, config.SELECTED_LABELS.index('VSINI')]
-    c_fe   = labels_23[:, config.SELECTED_LABELS.index('C_FE')]
-    o_fe   = labels_23[:, config.SELECTED_LABELS.index('O_FE')]
-    m_h    = labels_23[:, config.SELECTED_LABELS.index('M_H')]
-    eng = tf.stack([
-        5040.0 / (teff + 1e-6),
-        tf.sqrt(tf.square(vmacro) + tf.square(vsini)),
-        c_fe - o_fe,
-        0.5 * logg + 0.5 * m_h,
-    ], axis=-1)
-    return tf.concat([labels_23, eng], axis=-1)
-
-# ================================================================
-# MAP OPTIMISATION — FULLY XLA COMPILED
-# ================================================================
-
-@tf.function(jit_compile=True)
-def map_optimize_core(theta_unc, obs_flux, obs_ivar,
-                       fixed_abund, cnn_mu, cnn_std):
-    """
-    Batched Adam MAP for 9D core physics WITH cosine LR decay.
-    """
-    CORE_INDICES_PY  = [0,1,2,3,4,5,6,7,8]
-    ABUND_INDICES_PY = [9,10,11,12,13,14,15,16,17,18,19,20,21,22]
-    N_LABELS_RAW_PY  = 23
-    PRIOR_WEIGHT     = 1.0
-
-    core_cnn_mu  = tf.gather(cnn_mu, CORE_INDICES_PY, axis=1)
-    core_cnn_std = tf.gather(cnn_std, CORE_INDICES_PY, axis=1)
-
-    lr_init = tf.constant(LR_CORE_INIT, tf.float32)
-    lr_end  = tf.constant(LR_CORE_END, tf.float32)
-    beta1   = tf.constant(0.9, tf.float32)
-    beta2   = tf.constant(0.999, tf.float32)
-    eps     = tf.constant(1e-7, tf.float32)
-    n_total = tf.constant(float(N_STEPS_CORE), tf.float32)
-
-    m = tf.zeros_like(theta_unc)
-    v = tf.zeros_like(theta_unc)
-    theta = theta_unc
-    per_star_loss = tf.zeros(tf.shape(theta_unc)[0], dtype=tf.float32)
-
-    for step in tf.range(N_STEPS_CORE):
-        t_f = tf.cast(step, tf.float32)
-        frac = t_f / n_total
-        lr   = lr_end + 0.5 * (lr_init - lr_end) * (1.0 + tf.cos(frac * 3.14159265))
-
-        with tf.GradientTape() as tape:
-            tape.watch(theta)
-            theta_phys = _core_bij.forward(theta)
-
-            parts = []
-            for i in range(N_LABELS_RAW_PY):
-                if i in CORE_INDICES_PY:
-                    ci = CORE_INDICES_PY.index(i)
-                    parts.append(theta_phys[:, ci:ci+1])
-                else:
-                    ai = ABUND_INDICES_PY.index(i)
-                    parts.append(fixed_abund[:, ai:ai+1])
-            full_23 = tf.concat(parts, axis=1)
-
-            labels_27 = get_27_features(full_23)
-            labels_norm = (labels_27 - MEAN_TENSOR) / STD_TENSOR
-            model_flux = tf.cast(model_pure_fp32(labels_norm, training=False), tf.float32)
-            if(len(model_flux.shape)>2):
-                model_flux = tf.squeeze(model_flux, axis=-1)
-
-            safe_flux = tf.where(tf.math.is_finite(obs_flux), obs_flux, 0.0)
-            safe_ivar = tf.where(
-                tf.math.is_finite(obs_ivar) & tf.math.is_finite(obs_flux),
-                obs_ivar, 0.0)
-            safe_ivar = 1.0 / (1.0 / (safe_ivar + 1e-12) + 1e-5)
-            fv = tf.cast((safe_flux > 1e-3) & (safe_flux < 1.3), tf.float32)
-            iv = tf.cast(safe_ivar > 0.0, tf.float32)
-            mask = fv * iv
-
-            chi2 = tf.reduce_sum(tf.square(safe_flux - model_flux) * safe_ivar * mask, axis=1)
-            prior = tf.reduce_sum(
-                tf.square((theta_phys - core_cnn_mu) / core_cnn_std), axis=1
-            )
-            per_star_loss = 0.5 * chi2 + PRIOR_WEIGHT * 0.5 * prior
-            loss = tf.reduce_sum(per_star_loss)
-
-        grad = tape.gradient(loss, theta)
-        t_adam = tf.cast(step + 1, tf.float32)
-        m = beta1 * m + (1.0 - beta1) * grad
-        v = beta2 * v + (1.0 - beta2) * tf.square(grad)
-        m_hat = m / (1.0 - tf.pow(beta1, t_adam))
-        v_hat = v / (1.0 - tf.pow(beta2, t_adam))
-        theta = theta - lr * m_hat / (tf.sqrt(v_hat) + eps)
-
-    return _core_bij.forward(theta), per_star_loss
-
-
-@tf.function(jit_compile=True)
-def map_optimize_element(theta_unc_1d, obs_flux, obs_ivar,
-                          fixed_full_23, elem_col, pixel_mask,
-                          elem_lo, elem_hi, elem_cnn_mu, elem_cnn_std, prior_weight):
-    """
-    Batched Adam MAP for a single 1D abundance WITH cosine LR decay and prior scaling.
-    """
-    lo = tf.reshape(elem_lo, [1])
-    hi = tf.reshape(elem_hi, [1])
-    bij = tfb.Chain([tfb.Shift(lo), tfb.Scale(hi - lo), tfb.Sigmoid()])
-
-    lr_init = tf.constant(LR_ELEM_INIT, tf.float32)
-    lr_end  = tf.constant(LR_ELEM_END, tf.float32)
-    beta1   = tf.constant(0.9, tf.float32)
-    beta2   = tf.constant(0.999, tf.float32)
-    eps     = tf.constant(1e-7, tf.float32)
-    n_total = tf.constant(float(N_STEPS_ELEM), tf.float32)
-
-    m = tf.zeros_like(theta_unc_1d)
-    v = tf.zeros_like(theta_unc_1d)
-    theta = theta_unc_1d
-    per_star_loss = tf.zeros(tf.shape(theta_unc_1d)[0], dtype=tf.float32)
-
-    for step in tf.range(N_STEPS_ELEM):
-        t_f = tf.cast(step, tf.float32)
-        frac = t_f / n_total
-        lr   = lr_end + 0.5 * (lr_init - lr_end) * (1.0 + tf.cos(frac * 3.14159265))
-
-        with tf.GradientTape() as tape:
-            tape.watch(theta)
-            theta_phys = bij.forward(theta)
-
-            bc = tf.shape(fixed_full_23)[0]
-            indices = tf.stack([tf.range(bc), tf.fill([bc], elem_col)], axis=1)
-            full_spliced = tf.tensor_scatter_nd_update(
-                fixed_full_23, indices, theta_phys[:, 0]
-            )
-
-            labels_27 = get_27_features(full_spliced)
-            labels_norm = (labels_27 - MEAN_TENSOR) / STD_TENSOR
-            model_flux = tf.cast(model_pure_fp32(labels_norm, training=False), tf.float32)
-            if(len(model_flux.shape)>2):
-                model_flux = tf.squeeze(model_flux, axis=-1)
-
-            safe_flux = tf.where(tf.math.is_finite(obs_flux), obs_flux, 0.0)
-            safe_ivar = tf.where(
-                tf.math.is_finite(obs_ivar) & tf.math.is_finite(obs_flux),
-                obs_ivar, 0.0)
-            safe_ivar = 1.0 / (1.0 / (safe_ivar + 1e-12) + 1e-5)
-            fv = tf.cast((safe_flux > 1e-3) & (safe_flux < 1.3), tf.float32)
-            iv = tf.cast(safe_ivar > 0.0, tf.float32)
-            mask = fv * iv * tf.reshape(pixel_mask, [1, 8575])
-
-            chi2 = tf.reduce_sum(tf.square(safe_flux - model_flux) * safe_ivar * mask, axis=1)
-            prior = tf.reduce_sum(
-                tf.square((theta_phys - elem_cnn_mu) / elem_cnn_std), axis=1
-            )
-            # Apply per-element prior weight here!
-            per_star_loss = 0.5 * chi2 + prior_weight * 0.5 * prior
-            loss = tf.reduce_sum(per_star_loss)
-
-        grad = tape.gradient(loss, theta)
-        t_adam = tf.cast(step + 1, tf.float32)
-        m = beta1 * m + (1.0 - beta1) * grad
-        v = beta2 * v + (1.0 - beta2) * tf.square(grad)
-        m_hat = m / (1.0 - tf.pow(beta1, t_adam))
-        v_hat = v / (1.0 - tf.pow(beta2, t_adam))
-        theta = theta - lr * m_hat / (tf.sqrt(v_hat) + eps)
-
-    return bij.forward(theta)[:, 0], per_star_loss
-
-# ============================================================================
-#  JOINT 23-PARAMETER OPTIMIZATION (1-STAGE)
-# ============================================================================
-
-# Define the 23-dimensional bijectors globally (relying on your existing bounds_low/high)
-_joint_bij = tfb.Chain([tfb.Shift(bounds_low), tfb.Scale(bounds_high - bounds_low), tfb.Sigmoid()])
-_joint_inv = tfb.Invert(_joint_bij)
-
-@tf.function(jit_compile=True)
-def map_optimize_joint(theta_unc, obs_flux, obs_ivar, cnn_mu, cnn_std):
-    """
-    Batched Adam MAP for all 23 physics/abundance parameters simultaneously
-    WITH cosine LR decay, evaluated across the full spectrum.
-    """
-    lr_init = tf.constant(LR_CORE_INIT, tf.float32)
-    lr_end  = tf.constant(LR_CORE_END, tf.float32)
-    beta1   = tf.constant(0.9, tf.float32)
-    beta2   = tf.constant(0.999, tf.float32)
-    eps     = tf.constant(1e-7, tf.float32)
-    
-    # You can tune N_STEPS_JOINT; we default to CORE steps (e.g., 500)
-    N_STEPS_JOINT = N_STEPS_CORE 
-    n_total = tf.constant(float(N_STEPS_JOINT), tf.float32)
-
-    m = tf.zeros_like(theta_unc)
-    v = tf.zeros_like(theta_unc)
-    theta = theta_unc
-    per_star_loss = tf.zeros(tf.shape(theta_unc)[0], dtype=tf.float32)
-
-    for step in tf.range(N_STEPS_JOINT):
-        t_f = tf.cast(step, tf.float32)
-        frac = t_f / n_total
-        lr   = lr_end + 0.5 * (lr_init - lr_end) * (1.0 + tf.cos(frac * 3.14159265))
-
-        with tf.GradientTape() as tape:
-            tape.watch(theta)
-            theta_phys = _joint_bij.forward(theta)
-
-            # Generate spectrum directly from 23D joint space
-            labels_27 = get_27_features(theta_phys)
-            labels_norm = (labels_27 - MEAN_TENSOR) / STD_TENSOR
-            model_flux = tf.cast(model_pure_fp32(labels_norm, training=False), tf.float32)
-            
-            if len(model_flux.shape) > 2:
-                model_flux = tf.squeeze(model_flux, axis=-1)
-
-            # Masking out bad pixels / gaps
-            safe_flux = tf.where(tf.math.is_finite(obs_flux), obs_flux, 0.0)
-            safe_ivar = tf.where(
-                tf.math.is_finite(obs_ivar) & tf.math.is_finite(obs_flux),
-                obs_ivar, 0.0)
-            safe_ivar = 1.0 / (1.0 / (safe_ivar + 1e-12) + 1e-5)
-            fv = tf.cast((safe_flux > 1e-3) & (safe_flux < 1.3), tf.float32)
-            iv = tf.cast(safe_ivar > 0.0, tf.float32)
-            mask = fv * iv
-
-            # Loss: Full spectrum chi-squared + 23D CNN prior
-            chi2 = tf.reduce_sum(tf.square(safe_flux - model_flux) * safe_ivar * mask, axis=1)
-            prior = tf.reduce_sum(tf.square((theta_phys - cnn_mu) / cnn_std), axis=1)
-            
-            per_star_loss = 0.5 * chi2 + PRIOR_WEIGHT * 0.5 * prior
-            loss = tf.reduce_sum(per_star_loss)
-
-        grad = tape.gradient(loss, theta)
-        t_adam = tf.cast(step + 1, tf.float32)
-        m = beta1 * m + (1.0 - beta1) * grad
-        v = beta2 * v + (1.0 - beta2) * tf.square(grad)
-        m_hat = m / (1.0 - tf.pow(beta1, t_adam))
-        v_hat = v / (1.0 - tf.pow(beta2, t_adam))
-        theta = theta - lr * m_hat / (tf.sqrt(v_hat) + eps)
-
-    return _joint_bij.forward(theta), per_star_loss
-
-# ================================================================
-# CHECKPOINT / RESULTS
-# ================================================================
-
-def load_checkpoint():
+def load_checkpoint(path=None):
+    if path is None: path = CHECKPOINT_PATH
     fresh = {
         'global_indices': [], 'true_labels': [], 'inferred_labels': [],
-        'inferred_errors': [], 'aspcap_errors': [], 'wall_seconds': [],
-        'core_loss': [], 'elem_loss': []
+        'inferred_errors': [], 'aspcap_errors': [], 'wall_seconds': []
     }
-    if os.path.exists(CHECKPOINT_PATH):
-        data = np.load(CHECKPOINT_PATH, allow_pickle=True)
-        results = {k: list(data[k]) if k in data else [] for k in fresh}
-        n_done = len(results['global_indices'])
-        print(f"  Resuming: {n_done} stars done.")
-        return results, n_done
+    if os.path.exists(path):
+        data = np.load(path, allow_pickle=True)
+        return {k: list(data[k]) if k in data else [] for k in fresh}, len(data['global_indices'])
     return fresh, 0
 
-def save_checkpoint(results):
-    np.savez(CHECKPOINT_PATH, **{k: np.array(v) for k, v in results.items()})
-
-def save_final_results(results):
-    arrays = {k: np.array(v) for k, v in results.items()}
-    arrays['label_names'] = np.array(LABEL_NAMES)
-    np.savez(RESULTS_PATH, **arrays)
-    print(f"\nFinal results saved to {RESULTS_PATH}")
-
-# ================================================================
-# INFERENCE PIPELINE
-# ================================================================
-
-def run_inference_pipeline(test_indices, true_labels_norm, aspcap_errors,
-                           flux_array, ivar_array):
+def run_inference_pipeline(test_indices, true_labels_norm, aspcap_errors, flux_array, ivar_array):
     n_stars = len(test_indices)
-    true_labels_physical = (
-        true_labels_norm[:, :N_LABELS_RAW] * STD_TENSOR[:N_LABELS_RAW]
-        + MEAN_TENSOR[:N_LABELS_RAW]
-    )
+    true_labels_physical = (true_labels_norm[:, :23] * STD_TENSOR[:23] + MEAN_TENSOR[:23])
     results, n_done = load_checkpoint()
     remaining = list(range(n_done, n_stars))
 
-    print(f"\n{'='*60}")
-    print(f"  Tier 1: MAP Optimization (XLA compiled)")
-    print(f"  {n_stars} stars, batch {BATCH_SIZE_STARS}")
-    print(f"  Core: {N_STEPS_CORE} Adam steps, lr={LR_CORE_INIT}")
-    print(f"  Elements: {N_STEPS_ELEM} Adam steps each, lr={LR_ELEM_INIT}")
-    print(f"  To do: {len(remaining)} stars")
-    print(f"{'='*60}\n")
-
-    total_start = time.time()
-    batch_count = 0
-
-    for batch_start in range(0, len(remaining), BATCH_SIZE_STARS):
-        batch_local = remaining[batch_start:batch_start + BATCH_SIZE_STARS]
+    print(f"\n  Tier 1: Two-Stage MAP + Laplace ({len(remaining)} stars remaining)")
+    for batch_start in range(0, len(remaining), config.BATCH_SIZE_STARS):
+        batch_local = remaining[batch_start:batch_start + config.BATCH_SIZE_STARS]
         actual = len(batch_local)
-
+        
         b_flux = flux_array[batch_local].astype(np.float32)
         b_ivar = ivar_array[batch_local].astype(np.float32)
         cnn_mu, cnn_sig = cnn_predict_physical(b_flux)
 
-        # Pad
-        if actual < BATCH_SIZE_STARS:
-            pad = BATCH_SIZE_STARS - actual
-            b_flux = np.concatenate([b_flux, np.zeros((pad, N_PIXELS), np.float32)])
-            b_ivar = np.concatenate([b_ivar, np.zeros((pad, N_PIXELS), np.float32)])
-            cnn_mu  = np.concatenate([cnn_mu, np.tile(cnn_mu[:1], (pad, 1))])
+        if actual < config.BATCH_SIZE_STARS:
+            pad = config.BATCH_SIZE_STARS - actual
+            b_flux = np.concatenate([b_flux, np.zeros((pad, 8575), np.float32)])
+            b_ivar = np.concatenate([b_ivar, np.zeros((pad, 8575), np.float32)])
+            cnn_mu = np.concatenate([cnn_mu, np.tile(cnn_mu[:1], (pad, 1))])
             cnn_sig = np.concatenate([cnn_sig, np.tile(cnn_sig[:1], (pad, 1))])
 
-        obs_flux_tf = tf.constant(b_flux)
-        obs_ivar_tf = tf.constant(b_ivar)
-        cnn_mu_tf   = tf.constant(cnn_mu)
-        cnn_sig_tf  = tf.constant(cnn_sig)
+        obs_flux_tf, obs_ivar_tf = tf.constant(b_flux), tf.constant(b_ivar)
+        cnn_mu_tf, cnn_sig_tf = tf.constant(cnn_mu), tf.constant(cnn_sig)
 
-        # Stage 1: Core MAP
+        # -- Stage 1 Core --
         t0 = time.time()
-        core_init_phys = tf.gather(cnn_mu_tf, CORE_INDICES, axis=1)
-        margin = 1e-3
-        core_init_phys = tf.clip_by_value(
-            core_init_phys,
-            tf.gather(bounds_low + margin, CORE_INDICES),
-            tf.gather(bounds_high - margin, CORE_INDICES),
-        )
-        core_init_unc = _core_inv.forward(core_init_phys)
-
-        fixed_abund = tf.gather(cnn_mu_tf, ABUND_INDICES, axis=1)
-
-        core_result, core_final_loss = map_optimize_core(
-            core_init_unc, obs_flux_tf, obs_ivar_tf,
-            fixed_abund, cnn_mu_tf, cnn_sig_tf
-        )
-        core_loss_np = core_final_loss.numpy()
-        t_core = time.time() - t0
+        core_init = tf.clip_by_value(tf.gather(cnn_mu_tf, CORE_INDICES, 1), _core_low + 1e-3, _core_high - 1e-3)
+        core_result, _ = map_optimize_core(_core_inv.forward(core_init), obs_flux_tf, obs_ivar_tf, tf.gather(cnn_mu_tf, ABUND_INDICES, 1), cnn_mu_tf, cnn_sig_tf)
+        
         core_f_unc = _core_inv.forward(core_result)
-        core_errors = compute_uncertainties_core(core_f_unc, obs_flux_tf, obs_ivar_tf, fixed_abund, cnn_mu_tf, cnn_sig_tf)
-        core_err_np = core_errors.numpy()
-        print(f"    S1 core MAP: {t_core:.2f}s")
+        core_errs = compute_uncertainties_core(core_f_unc, obs_flux_tf, obs_ivar_tf, tf.gather(cnn_mu_tf, ABUND_INDICES, 1), cnn_mu_tf, cnn_sig_tf)
+        core_np, core_err_np = core_result.numpy(), core_errs.numpy()
+        t_core = time.time() - t0
 
-        # Build fixed_23 with core results
-        fixed_23 = cnn_mu.copy()
-        core_np = core_result.numpy()
-        for ci, gi in enumerate(CORE_INDICES):
-            fixed_23[:, gi] = core_np[:, ci]
-
-        # Stage 2: Element MAP
+        # -- Stage 2 Elements --
         t0 = time.time()
-        elem_results = np.zeros((BATCH_SIZE_STARS, N_LABELS_RAW), np.float32)
-        elem_errors  = np.zeros((BATCH_SIZE_STARS, N_LABELS_RAW), np.float32)
+        fixed_23 = cnn_mu.copy()
+        for ci, gi in enumerate(CORE_INDICES): fixed_23[:, gi] = core_np[:, ci]
+        
+        elem_results = np.zeros((config.BATCH_SIZE_STARS, 23), np.float32)
+        elem_errors  = np.zeros((config.BATCH_SIZE_STARS, 23), np.float32)
         for ci, gi in enumerate(CORE_INDICES):
             elem_results[:, gi] = core_np[:, ci]
             elem_errors[:, gi]  = core_err_np[:, ci]
 
-        elem_losses = np.zeros((BATCH_SIZE_STARS, N_ABUND), np.float32)
         for ai, elem_idx in enumerate(ABUND_INDICES):
-            elem_init_phys = cnn_mu[:, elem_idx:elem_idx+1]
-            lo_val = lower_bounds[elem_idx]
-            hi_val = upper_bounds[elem_idx]
-            elem_init_phys = np.clip(elem_init_phys, lo_val + margin, hi_val - margin)
-
-            lo_tf = tf.constant(lo_val, tf.float32)
-            hi_tf = tf.constant(hi_val, tf.float32)
-            inv_bij = tfb.Invert(tfb.Chain([
-                tfb.Shift(tf.reshape(lo_tf, [1])),
-                tfb.Scale(tf.reshape(hi_tf - lo_tf, [1])),
-                tfb.Sigmoid(),
-            ]))
-            elem_init_unc = inv_bij.forward(tf.constant(elem_init_phys, tf.float32))
-
-            e_result, e_loss = map_optimize_element(
-                elem_init_unc, obs_flux_tf, obs_ivar_tf,
-                tf.constant(fixed_23, tf.float32), elem_idx,
-                ELEMENT_PIXEL_MASKS[elem_idx],
-                lo_tf, hi_tf,
-                cnn_mu_tf[:, elem_idx:elem_idx+1],
-                cnn_sig_tf[:, elem_idx:elem_idx+1],
-                ELEMENT_PRIOR_WEIGHTS[elem_idx],
-            )
-            e_err = compute_uncertainties_element(inv_bij.forward(e_result), obs_flux_tf, obs_ivar_tf, tf.constant(fixed_23, tf.float32), elem_idx, ELEMENT_PIXEL_MASKS[elem_idx], lo_tf, hi_tf, cnn_mu_tf[:, elem_idx:elem_idx+1], cnn_sig_tf[:, elem_idx:elem_idx+1], ELEMENT_PRIOR_WEIGHTS[elem_idx])
+            lo, hi = lower_bounds[elem_idx], upper_bounds[elem_idx]
+            inv_bij = tfb.Invert(tfb.Chain([tfb.Shift(tf.reshape(lo, [1])), tfb.Scale(tf.reshape(hi-lo, [1])), tfb.Sigmoid()]))
+            e_init = tf.clip_by_value(cnn_mu_tf[:, elem_idx:elem_idx+1], lo+1e-3, hi-1e-3)
+            e_result, _ = map_optimize_element(inv_bij.forward(e_init), obs_flux_tf, obs_ivar_tf, tf.constant(fixed_23, tf.float32), elem_idx, ELEMENT_PIXEL_MASKS[elem_idx], lo, hi, cnn_mu_tf[:, elem_idx:elem_idx+1], cnn_sig_tf[:, elem_idx:elem_idx+1], ELEMENT_PRIOR_WEIGHTS[elem_idx])
+            
+            e_err = compute_uncertainties_element(inv_bij.forward(e_result), obs_flux_tf, obs_ivar_tf, tf.constant(fixed_23, tf.float32), elem_idx, ELEMENT_PIXEL_MASKS[elem_idx], lo, hi, cnn_mu_tf[:, elem_idx:elem_idx+1], cnn_sig_tf[:, elem_idx:elem_idx+1], ELEMENT_PRIOR_WEIGHTS[elem_idx])
             elem_results[:, elem_idx] = e_result.numpy()
             elem_errors[:, elem_idx]  = e_err.numpy()
             fixed_23[:, elem_idx] = e_result.numpy()
-            elem_losses[:, ai] = e_loss.numpy()
-
         t_elem = time.time() - t0
-        print(f"    S2 elem MAP: {t_elem:.2f}s ({N_ABUND} elements)")
 
         elapsed = t_core + t_elem
-
         for b in range(actual):
-            local_idx = batch_local[b]
-            global_idx = int(test_indices[local_idx])
-            results['global_indices'].append(global_idx)
-            results['true_labels'].append(true_labels_physical[local_idx])
+            results['global_indices'].append(int(test_indices[batch_local[b]]))
+            results['true_labels'].append(true_labels_physical[batch_local[b]])
             results['inferred_labels'].append(elem_results[b])
             results['inferred_errors'].append(elem_errors[b])
-            results['aspcap_errors'].append(aspcap_errors[local_idx, :N_LABELS_RAW])
+            results['aspcap_errors'].append(aspcap_errors[batch_local[b]])
             results['wall_seconds'].append(elapsed / actual)
-            results['core_loss'].append(core_loss_np[b])
-            results['elem_loss'].append(elem_losses[b])
-
+            
         n_done += actual
-        batch_count += 1
-        save_checkpoint(results)
+        np.savez(CHECKPOINT_PATH, **{k: np.array(v) for k, v in results.items()})
+        print(f"  [{n_done:>4}/{n_stars}] Batch done.")
 
-        est_left = (n_stars - n_done) * elapsed / actual / 60
-        print(f"  [{n_done:>4}/{n_stars}]  {elapsed:.1f}s  (~{est_left:.0f} min left)\n")
-
-    total_elapsed = time.time() - total_start
-    print(f"\nAll {n_stars} stars done in {total_elapsed:.1f}s ({total_elapsed/60:.1f} min).")
     save_final_results(results)
     return results
 
-    
-# ============================================================================
-#  ALTERNATIVE INFERENCE PIPELINE (JOINT 23-PARAM)
-# ============================================================================
-
-def run_inference_pipeline_alt(test_indices, true_labels_norm, aspcap_errors,
-                               flux_array, ivar_array):
-    
-    # Unique paths to prevent clobbering 2-stage data
+def run_inference_pipeline_alt(test_indices, true_labels_norm, aspcap_errors, flux_array, ivar_array):
     CHECKPOINT_ALT_PATH = os.path.join(RESULTS_DIR, "checkpoint_alt.npz")
-    RESULTS_ALT_PATH    = os.path.join(RESULTS_DIR, "results_alt.npz")
-    
-    def load_alt_checkpoint():
-        fresh = {
-            'global_indices': [], 'true_labels': [], 'inferred_labels': [],
-            'inferred_errors': [], 'aspcap_errors': [], 'wall_seconds': [],
-            'core_loss': [], 'elem_loss': [] # Kept for downstream compatibility
-        }
-        if os.path.exists(CHECKPOINT_ALT_PATH):
-            data = np.load(CHECKPOINT_ALT_PATH, allow_pickle=True)
-            results = {k: list(data[k]) if k in data else [] for k in fresh}
-            n_done = len(results['global_indices'])
-            print(f"  Resuming (Joint MAP): {n_done} stars done.")
-            return results, n_done
-        return fresh, 0
+    true_labels_physical = (true_labels_norm[:, :23] * STD_TENSOR[:23] + MEAN_TENSOR[:23])
+    results, n_done = load_checkpoint(CHECKPOINT_ALT_PATH)
+    remaining = list(range(n_done, len(test_indices)))
 
-    n_stars = len(test_indices)
-    true_labels_physical = (
-        true_labels_norm[:, :N_LABELS_RAW] * STD_TENSOR[:N_LABELS_RAW]
-        + MEAN_TENSOR[:N_LABELS_RAW]
-    )
-    
-    results, n_done = load_alt_checkpoint()
-    remaining = list(range(n_done, n_stars))
-
-    print(f"\n{'='*60}")
-    print(f"  Tier 1-Alt: JOINT MAP Optimization (XLA compiled)")
-    print(f"  {n_stars} stars, batch {BATCH_SIZE_STARS}")
-    print(f"  Joint: {N_STEPS_CORE} Adam steps, lr={LR_CORE_INIT}")
-    print(f"  To do: {len(remaining)} stars")
-    print(f"{'='*60}\n")
-
-    total_start = time.time()
-
-    for batch_start in range(0, len(remaining), BATCH_SIZE_STARS):
-        batch_local = remaining[batch_start:batch_start + BATCH_SIZE_STARS]
+    print(f"\n  Tier 1-Alt: Joint MAP + Laplace ({len(remaining)} stars remaining)")
+    for batch_start in range(0, len(remaining), config.BATCH_SIZE_STARS):
+        batch_local = remaining[batch_start:batch_start + config.BATCH_SIZE_STARS]
         actual = len(batch_local)
-
         b_flux = flux_array[batch_local].astype(np.float32)
         b_ivar = ivar_array[batch_local].astype(np.float32)
         cnn_mu, cnn_sig = cnn_predict_physical(b_flux)
 
-        # Pad partial batches for XLA
-        if actual < BATCH_SIZE_STARS:
-            pad = BATCH_SIZE_STARS - actual
-            b_flux = np.concatenate([b_flux, np.zeros((pad, N_PIXELS), np.float32)])
-            b_ivar = np.concatenate([b_ivar, np.zeros((pad, N_PIXELS), np.float32)])
-            cnn_mu  = np.concatenate([cnn_mu, np.tile(cnn_mu[:1], (pad, 1))])
+        if actual < config.BATCH_SIZE_STARS:
+            pad = config.BATCH_SIZE_STARS - actual
+            b_flux = np.concatenate([b_flux, np.zeros((pad, 8575), np.float32)])
+            b_ivar = np.concatenate([b_ivar, np.zeros((pad, 8575), np.float32)])
+            cnn_mu = np.concatenate([cnn_mu, np.tile(cnn_mu[:1], (pad, 1))])
             cnn_sig = np.concatenate([cnn_sig, np.tile(cnn_sig[:1], (pad, 1))])
 
-        obs_flux_tf = tf.constant(b_flux)
-        obs_ivar_tf = tf.constant(b_ivar)
-        cnn_mu_tf   = tf.constant(cnn_mu)
-        cnn_sig_tf  = tf.constant(cnn_sig)
+        obs_flux_tf, obs_ivar_tf = tf.constant(b_flux), tf.constant(b_ivar)
+        cnn_mu_tf, cnn_sig_tf = tf.constant(cnn_mu), tf.constant(cnn_sig)
 
         t0 = time.time()
-        
-        # Initialize all 23 parameters
         margin = 1e-3
-        joint_init_phys = tf.clip_by_value(
-            cnn_mu_tf,
-            bounds_low + margin,
-            bounds_high - margin,
-        )
-        joint_init_unc = _joint_inv.forward(joint_init_phys)
-
-        # Execute single-stage joint optimization
-        joint_result, joint_final_loss = map_optimize_joint(
-            joint_init_unc, obs_flux_tf, obs_ivar_tf,
-            cnn_mu_tf, cnn_sig_tf
-        )
+        j_init = tf.clip_by_value(cnn_mu_tf, bounds_low + margin, bounds_high - margin)
+        j_result, _ = map_optimize_joint(_joint_inv.forward(j_init), obs_flux_tf, obs_ivar_tf, cnn_mu_tf, cnn_sig_tf)
         
-        joint_loss_np = joint_final_loss.numpy()
-        joint_result_np = joint_result.numpy()
-        joint_errors_np = compute_uncertainties_joint(_joint_inv.forward(joint_result), obs_flux_tf, obs_ivar_tf, cnn_mu_tf, cnn_sig_tf).numpy()
-        joint_errors_np = compute_uncertainties_joint(_joint_inv.forward(joint_result), obs_flux_tf, obs_ivar_tf, cnn_mu_tf, cnn_sig_tf).numpy()
+        j_errors = compute_uncertainties_joint(_joint_inv.forward(j_result), obs_flux_tf, obs_ivar_tf, cnn_mu_tf, cnn_sig_tf)
+        j_res_np, j_err_np = j_result.numpy(), j_errors.numpy()
         elapsed = time.time() - t0
-        
-        print(f"    Joint MAP ({N_STEPS_CORE} steps): {elapsed:.2f}s")
 
-        # Record results
         for b in range(actual):
-            local_idx = batch_local[b]
-            global_idx = int(test_indices[local_idx])
-            results['global_indices'].append(global_idx)
-            results['true_labels'].append(true_labels_physical[local_idx])
-            results['inferred_labels'].append(joint_result_np[b])
-            results['inferred_errors'].append(joint_errors_np[b])
-            results['inferred_errors'].append(joint_errors_np[b])
-            results['inferred_errors'].append(joint_errors_np[b])
-            results['aspcap_errors'].append(aspcap_errors[local_idx, :N_LABELS_RAW])
+            results['global_indices'].append(int(test_indices[batch_local[b]]))
+            results['true_labels'].append(true_labels_physical[batch_local[b]])
+            results['inferred_labels'].append(j_res_np[b])
+            results['inferred_errors'].append(j_err_np[b])
+            results['aspcap_errors'].append(aspcap_errors[batch_local[b]])
             results['wall_seconds'].append(elapsed / actual)
-            results['core_loss'].append(joint_loss_np[b]) 
-            results['elem_loss'].append(np.zeros(N_ABUND)) # Dummy array for compatibility
-
+            
         n_done += actual
         np.savez(CHECKPOINT_ALT_PATH, **{k: np.array(v) for k, v in results.items()})
+        print(f"  [{n_done:>4}/{len(test_indices)}] Batch done.")
 
-        est_left = (n_stars - n_done) * elapsed / actual / 60
-        print(f"  [{n_done:>4}/{n_stars}]  {elapsed:.1f}s  (~{est_left:.0f} min left)\n")
-
-    total_elapsed = time.time() - total_start
-    print(f"\nAll {n_stars} stars done in {total_elapsed:.1f}s ({total_elapsed/60:.1f} min).")
-    
-    # Save final
-    arrays = {k: np.array(v) for k, v in results.items()}
-    arrays['label_names'] = np.array(LABEL_NAMES)
-    np.savez(RESULTS_ALT_PATH, **arrays)
-    print(f"Final results saved to {RESULTS_ALT_PATH}")
-    
+    save_final_results(results, RESULTS_ALT_PATH) # Assuming path definition
     return results
-# ================================================================
-# MAIN
-# ================================================================\
 
-
-
-# --- CELL SEPARATOR ---
-
-import time
-
-@tf.function(jit_compile=True)
-def compute_uncertainties_core(theta_unc_batch, obs_flux, obs_ivar, fixed_abund, cnn_mu, cnn_std):
-    """Laplace approx for Stage 1 (9D)."""
-    n_params = 9
-    core_cnn_mu = tf.gather(cnn_mu, CORE_INDICES, axis=1)
-    core_cnn_std = tf.gather(cnn_std, CORE_INDICES, axis=1)
-    def single_star_hessian(args):
-        theta_unc, flux, ivar, f_abund, c_mu, c_std = args
-        with tf.GradientTape() as outer_tape:
-            outer_tape.watch(theta_unc)
-            with tf.GradientTape() as inner_tape:
-                inner_tape.watch(theta_unc)
-                theta_phys = _core_bij.forward(theta_unc)
-                parts = []
-                for i in range(23):
-                    if i in CORE_INDICES: ci = CORE_INDICES.index(i); parts.append(tf.reshape(theta_phys[ci], [1]))
-                    else: ai = ABUND_INDICES.index(i); parts.append(tf.reshape(f_abund[ai], [1]))
-                full_23 = tf.concat(parts, axis=0)
-                labels_27 = get_27_features(tf.expand_dims(full_23, 0))
-                labels_norm = (labels_27 - MEAN_TENSOR) / STD_TENSOR
-                model_flux = tf.squeeze(tf.cast(model_pure_fp32(labels_norm, training=False), tf.float32))
-                safe_flux = tf.where(tf.math.is_finite(flux), flux, 0.0)
-                safe_ivar = tf.where(tf.math.is_finite(ivar) & tf.math.is_finite(flux), ivar, 0.0)
-                safe_ivar = 1.0 / (1.0 / (safe_ivar + 1e-12) + 1e-5)
-                mask = tf.cast((safe_flux > 1e-3) & (safe_flux < 1.3) & (safe_ivar > 0.0), tf.float32)
-                chi2 = tf.reduce_sum(tf.square(safe_flux - model_flux) * safe_ivar * mask)
-                prior = tf.reduce_sum(tf.square((theta_phys - c_mu) / c_std))
-                loss = 0.5 * chi2 + PRIOR_WEIGHT * 0.5 * prior
-            grad = inner_tape.gradient(loss, theta_unc)
-        hess = outer_tape.jacobian(grad, theta_unc)
-        hess_reg = hess + tf.eye(n_params) * 1e-6
-        cov_unc = tf.linalg.inv(hess_reg)
-        var_unc = tf.abs(tf.linalg.diag_part(cov_unc))
-        s = tf.nn.sigmoid(theta_unc); jacobian_diag = s * (1.0 - s) * (_core_high - _core_low)
-        return tf.sqrt(var_unc) * jacobian_diag
-    return tf.vectorized_map(single_star_hessian, (theta_unc_batch, obs_flux, obs_ivar, fixed_abund, core_cnn_mu, core_cnn_std))
-
-@tf.function(jit_compile=True)
-def compute_uncertainties_element(theta_unc_1d, obs_flux, obs_ivar, fixed_full_23, 
-                                 elem_col, pixel_mask, elem_lo, elem_hi, 
-                                 elem_cnn_mu, elem_cnn_std, prior_weight):
-    """Laplace approx for Stage 2 (1D)."""
-    lo = tf.reshape(elem_lo, [1]); hi = tf.reshape(elem_hi, [1])
-    bij = tfb.Chain([tfb.Shift(lo), tfb.Scale(hi - lo), tfb.Sigmoid()])
-    def single_star_hessian(args):
-        theta_unc, flux, ivar, f_23, c_mu, c_std = args
-        with tf.GradientTape() as tape:
-            tape.watch(theta_unc)
-            with tf.GradientTape() as inner_tape:
-                inner_tape.watch(theta_unc)
-                theta_phys = bij.forward(theta_unc)
-                indices = tf.constant([[0, elem_col]])
-                full_spliced = tf.tensor_scatter_nd_update(tf.expand_dims(f_23, 0), indices, theta_phys)
-                labels_27 = get_27_features(full_spliced)
-                labels_norm = (labels_27 - MEAN_TENSOR) / STD_TENSOR
-                model_flux = tf.squeeze(tf.cast(model_pure_fp32(labels_norm, training=False), tf.float32))
-                safe_flux = tf.where(tf.math.is_finite(flux), flux, 0.0)
-                safe_ivar = tf.where(tf.math.is_finite(ivar) & tf.math.is_finite(flux), ivar, 0.0)
-                safe_ivar = 1.0 / (1.0 / (safe_ivar + 1e-12) + 1e-5)
-                mask = tf.cast((safe_flux > 1e-3) & (safe_flux < 1.3) & (safe_ivar > 0.0), tf.float32) * pixel_mask
-                chi2 = tf.reduce_sum(tf.square(safe_flux - model_flux) * safe_ivar * mask)
-                prior = tf.reduce_sum(tf.square((theta_phys - c_mu) / c_std))
-                loss = 0.5 * chi2 + prior_weight * 0.5 * prior
-            grad = inner_tape.gradient(loss, theta_unc)
-        hess = tape.gradient(grad, theta_unc)
-        var_unc = 1.0 / tf.abs(hess + 1e-6)
-        s = tf.nn.sigmoid(theta_unc); jacobian = s * (1.0 - s) * (hi - lo)
-        return tf.sqrt(var_unc[0]) * jacobian[0]
-    return tf.vectorized_map(single_star_hessian, (theta_unc_1d, obs_flux, obs_ivar, fixed_full_23, elem_cnn_mu, elem_cnn_std))
-
-@tf.function(jit_compile=True)
-def compute_uncertainties_joint(theta_unc_batch, obs_flux, obs_ivar, cnn_mu, cnn_std):
-    """Laplace approx for Joint MAP (23D)."""
-    n_params = 23
-    def single_star_hessian(args):
-        theta_unc, flux, ivar, c_mu, c_std = args
-        with tf.GradientTape() as outer_tape:
-            outer_tape.watch(theta_unc)
-            with tf.GradientTape() as inner_tape:
-                inner_tape.watch(theta_unc)
-                theta_phys = _joint_bij.forward(theta_unc)
-                labels_27 = get_27_features(tf.expand_dims(theta_phys, 0))
-                labels_norm = (labels_27 - MEAN_TENSOR) / STD_TENSOR
-                model_flux = tf.squeeze(tf.cast(model_pure_fp32(labels_norm, training=False), tf.float32))
-                safe_flux = tf.where(tf.math.is_finite(flux), flux, 0.0)
-                safe_ivar = tf.where(tf.math.is_finite(ivar) & tf.math.is_finite(flux), ivar, 0.0)
-                safe_ivar = 1.0 / (1.0 / (safe_ivar + 1e-12) + 1e-5)
-                mask = tf.cast((safe_flux > 1e-3) & (safe_flux < 1.3) & (safe_ivar > 0.0), tf.float32)
-                chi2 = tf.reduce_sum(tf.square(safe_flux - model_flux) * safe_ivar * mask)
-                prior = tf.reduce_sum(tf.square((theta_phys - c_mu) / c_std))
-                loss = 0.5 * chi2 + PRIOR_WEIGHT * 0.5 * prior
-            grad = inner_tape.gradient(loss, theta_unc)
-        hess = outer_tape.jacobian(grad, theta_unc)
-        hess_reg = hess + tf.eye(n_params) * 1e-6
-        cov_unc = tf.linalg.inv(hess_reg)
-        var_unc = tf.abs(tf.linalg.diag_part(cov_unc))
-        s = tf.nn.sigmoid(theta_unc); jacobian_diag = s * (1.0 - s) * (bounds_high - bounds_low)
-        return tf.sqrt(var_unc) * jacobian_diag
-    return tf.vectorized_map(single_star_hessian, (theta_unc_batch, obs_flux, obs_ivar, cnn_mu, cnn_std))
-
-def report_map_results_enriched(data: dict, print_report: bool = True) -> dict:
-    """Summary statistics including Laplace uncertainties."""
-    label_names, residuals, aspcap_err = data["label_names"], data["residuals"], data["aspcap_errors"]
-    inf_err = data.get("inferred_errors", np.zeros_like(residuals))
-    n_stars, wall = data["n_stars"], data["wall_seconds"]
-    report = {}
-    for j, name in enumerate(label_names):
-        r, ie, ae = residuals[:, j], inf_err[:, j], aspcap_err[:, j]
-        report[name] = {
-            "bias": np.median(r), "mad": np.median(np.abs(r - np.median(r))), "rmse": np.sqrt(np.mean(r**2)),
-            "sigma_rmse": np.sqrt(np.mean(ie**2)), "sigma_mad": np.median(np.abs(ie - np.median(ie))),
-            "ratio": np.median(ae / np.where(ie > 1e-10, ie, 1e-10)), "n_stars": n_stars,
-        }
-    if print_report:
-        hdr  = f"{'Label':<10} {'Bias':>8} {'MAD':>8} {'RMSE':>8} {'Mod-\u03c3':>8} {'\u03c3-MAD':>8} {'Ratio':>6}"
-        rule = "─" * len(hdr)
-        print(f"\n  Enriched Summary\n  {rule}\n  {hdr}\n  {rule}")
-        for n in label_names:
-            s = report[n]
-            print(f"  {n:<10} {s['bias']:>8.3f} {s['mad']:>8.3f} {s['rmse']:>8.3f} {s['sigma_rmse']:>8.3f} {s['sigma_mad']:>8.3f} {s['ratio']:>6.1f}x")
-        print(f"  {rule}")
-    return report
-
-
-# --- CELL SEPARATOR ---
-
-
-if __name__ == "__main__":
-
-    def select_stratified_test_sample(h5_path, stats_path, selected_labels,
-                                       test_start, test_end, target_n=5,
-                                       logg_bins=5, teff_bins=10, mh_bins=10):
-        """Identical to notebook; selects stratified test stars."""
-        max_bins = logg_bins * teff_bins * mh_bins
-        with h5py.File(h5_path, 'r') as f:
-            meta = f['metadata']
-            teff = meta['TEFF'][test_start:test_end].astype(np.float32)
-            logg = meta['LOGG'][test_start:test_end].astype(np.float32)
-            m_h  = meta['M_H'][test_start:test_end].astype(np.float32)
-            snr  = meta['SNR'][test_start:test_end].astype(np.float32)
-
-        SENTINEL = -5000.0
-        valid = (teff > SENTINEL) & (logg > SENTINEL) & (m_h > SENTINEL)
-
-        def percentile_edges(values, mask, n_bins):
-            pts = np.linspace(0, 100, n_bins + 1)
-            edges = np.percentile(values[mask], pts)
-            edges[0] -= 1e-6; edges[-1] += 1e-6
-            return edges
-
-        logg_edges = percentile_edges(logg, valid, logg_bins)
-        teff_edges = percentile_edges(teff, valid, teff_bins)
-        mh_edges   = percentile_edges(m_h, valid, mh_bins)
-
-        logg_bin = np.clip(np.digitize(logg, logg_edges) - 1, 0, logg_bins - 1)
-        teff_bin = np.clip(np.digitize(teff, teff_edges) - 1, 0, teff_bins - 1)
-        mh_bin   = np.clip(np.digitize(m_h, mh_edges) - 1, 0, mh_bins - 1)
-
-        local_indices_selected = []
-        bin_summary = []
-        for i in range(logg_bins):
-            for j in range(teff_bins):
-                for k in range(mh_bins):
-                    in_bin = valid & (logg_bin == i) & (teff_bin == j) & (mh_bin == k)
-                    idx = np.where(in_bin)[0]
-                    if len(idx) == 0: continue
-                    median_snr = np.median(snr[idx])
-                    closest = idx[np.argmin(np.abs(snr[idx] - median_snr))]
-                    local_indices_selected.append(closest)
-                    bin_summary.append({'n_stars': len(idx)})
-
-        local_indices_selected = np.array(local_indices_selected)
-        n_from_bins = len(local_indices_selected)
-
-        if n_from_bins < target_n:
-            shortfall = target_n - n_from_bins
-            remaining = np.array([i for i in np.where(valid)[0]
-                                  if i not in set(local_indices_selected.tolist())])
-            rng = np.random.default_rng(42)
-            extra = rng.choice(remaining, size=min(shortfall, len(remaining)), replace=False)
-            local_indices_selected = np.concatenate([local_indices_selected, extra])
-        elif n_from_bins > target_n:
-            occupancies = np.array([b['n_stars'] for b in bin_summary])
-            order = np.argsort(occupancies)
-            local_indices_selected = local_indices_selected[order[:target_n]]
-
-        global_indices = np.sort(local_indices_selected + test_start)
-        print(f"Selected {len(global_indices)} test stars.")
-        return global_indices
-
-    TEST_START = 140_000
-    TEST_END   = 149_500
-
-    global_indices = select_stratified_test_sample(
-        config.H5_PATH, config.STATS_PATH, config.SELECTED_LABELS,
-        TEST_START, TEST_END, target_n=TOTAL_STARS, logg_bins=5, teff_bins=10, mh_bins=10,
-    )
-    np.save("test_indices.npy", global_indices)
-
-    test_indices = np.load("test_indices.npy")
-    results = run_inference_pipeline(
-        test_indices=test_indices,
-        true_labels_norm=labels,
-        aspcap_errors=label_err,
-        flux_array=real_data,
-        ivar_array=real_data_ivar,
-    )
-
-
-# --- CELL SEPARATOR ---
-
-
-import os
-import textwrap
-from pathlib import Path
-
-import numpy as np
-import matplotlib
-matplotlib.use("Agg")              # safe default for scripts / Kaggle
-import matplotlib.pyplot as plt
-from matplotlib.gridspec import GridSpec
-from matplotlib.ticker import MaxNLocator
-from matplotlib.colors import LogNorm
-
-# ─────────────────────────────────────────────────────────────────
-# CONSTANTS
-# ─────────────────────────────────────────────────────────────────
-
-PRETTY_NAMES = {
-    "TEFF": r"$T_{\rm eff}$ [K]",
-    "LOGG": r"$\log g$",
-    "M_H": "[M/H]",
-    "VMICRO": r"$v_{\rm micro}$ [km/s]",
-    "VMACRO": r"$v_{\rm macro}$ [km/s]",
-    "VSINI": r"$v \sin i$ [km/s]",
-    "C_FE": "[C/H]",
-    "N_FE": "[N/H]",
-    "O_FE": "[O/H]",
-    "FE_H": "[Fe/H]",
-    "MG_FE": "[Mg/H]",
-    "SI_FE": "[Si/H]",
-    "CA_FE": "[Ca/H]",
-    "TI_FE": "[Ti/H]",
-    "S_FE": "[S/H]",
-    "AL_FE": "[Al/H]",
-    "MN_FE": "[Mn/H]",
-    "NI_FE": "[Ni/H]",
-    "CR_FE": "[Cr/H]",
-    "K_FE": "[K/H]",
-    "NA_FE": "[Na/H]",
-    "V_FE": "[V/H]",
-    "CO_FE": "[Co/H]",
-}
-
-CORE_LABELS  = ["TEFF", "LOGG", "M_H", "VMICRO", "VMACRO", "VSINI", "C_FE", "N_FE", "O_FE"]
-ABUND_LABELS = ["FE_H", "MG_FE", "SI_FE", "CA_FE", "TI_FE", "S_FE",
-                "AL_FE", "MN_FE", "NI_FE", "CR_FE", "K_FE", "NA_FE", "V_FE", "CO_FE"]
-
-TEFF_SCALE = 100.0   # report Teff residuals in units of 100 K
-
-
-# ─────────────────────────────────────────────────────────────────
-# 1. LOAD
-# ─────────────────────────────────────────────────────────────────
-
-def load_map_results(path: str) -> dict:
-    """
-    Load a MAP results.npz file and return a standardised dict.
-
-    Returns
-    -------
-    dict with keys:
-        label_names      : list[str]  — 23 label names
-        n_stars          : int
-        n_labels         : int
-        true_labels      : (N, 23) array, physical units
-        inferred_labels  : (N, 23) array, physical units
-        residuals        : (N, 23) array  (inferred − true)
-        aspcap_errors    : (N, 23) array
-        wall_seconds     : (N,) array
-        global_indices   : (N,) array
-    """
-    path = str(path)
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Results file not found: {path}")
-
-    raw = np.load(path, allow_pickle=True)
-
-    label_names = [s.item() if isinstance(s, np.generic) else str(s)
-                   for s in raw["label_names"]]
-    true      = raw["true_labels"].astype(np.float64)
-    inferred  = raw["inferred_labels"].astype(np.float64)
-    aspcap_err = raw["aspcap_errors"].astype(np.float64)
-    wall      = raw["wall_seconds"].astype(np.float64)
-    gidx      = raw["global_indices"]
-
-    return {
-        "label_names":     label_names,
-        "n_stars":         len(gidx),
-        "n_labels":        len(label_names),
-        "true_labels":     true,
-        "inferred_labels": inferred,
-        "residuals":       inferred - true,
-        "aspcap_errors":   aspcap_err,
-        "wall_seconds":    wall,
-        "global_indices":  gidx,
-    }
-
-
-# ─────────────────────────────────────────────────────────────────
-# 2. REPORT
-# ─────────────────────────────────────────────────────────────────
-
-def _iqr(x):
-    """Interquartile range."""
-    return np.percentile(x, 75) - np.percentile(x, 25)
-
-
-def report_map_results(data: dict, print_report: bool = True) -> dict:
-    """
-    Compute per-label summary statistics and optionally print a table.
-
-    Returns
-    -------
-    dict  label_name → {bias, mad, rmse, iqr, median_aspcap_err, n_stars}
-    """
-    label_names = data["label_names"]
-    residuals   = data["residuals"]
-    aspcap_err  = data["aspcap_errors"]
-    n_stars     = data["n_stars"]
-    wall        = data["wall_seconds"]
-
-    report = {}
-    for j, name in enumerate(label_names):
-        r = residuals[:, j]
-        report[name] = {
-            "bias":              np.median(r),
-            "mad":               np.median(np.abs(r - np.median(r))),
-            "rmse":              np.sqrt(np.mean(r**2)),
-            "iqr":               _iqr(r),
-            "median_aspcap_err": np.median(aspcap_err[:, j]),
-            "n_stars":           n_stars,
-        }
-
-    if print_report:
-        hdr  = f"{'Label':<10} {'Bias':>10} {'MAD':>10} {'RMSE':>10} {'IQR':>10} {'ASPCAP σ':>10}"
-        rule = "─" * len(hdr)
-        lines = [
-            "",
-            "╔══════════════════════════════════════════════════════════════════╗",
-            "║            MAP Results — Summary Statistics                     ║",
-            f"║  {n_stars} stars,  median wall-time = {np.median(wall):.2f} s/star{' '*(21 - len(f'{np.median(wall):.2f}'))}║",
-            "╚══════════════════════════════════════════════════════════════════╝",
-            "",
-            "  Core physics parameters",
-            f"  {rule}",
-            f"  {hdr}",
-            f"  {rule}",
-        ]
-        for name in CORE_LABELS:
-            if name not in report:
-                continue
-            s = report[name]
-            lines.append(
-                f"  {PRETTY_NAMES.get(name, name):<10} "
-                f"{s['bias']:>+10.4f} {s['mad']:>10.4f} {s['rmse']:>10.4f} "
-                f"{s['iqr']:>10.4f} {s['median_aspcap_err']:>10.4f}"
-            )
-        lines += [
-            f"  {rule}",
-            "",
-            "  Individual abundances",
-            f"  {rule}",
-            f"  {hdr}",
-            f"  {rule}",
-        ]
-        for name in ABUND_LABELS:
-            if name not in report:
-                continue
-            s = report[name]
-            lines.append(
-                f"  {PRETTY_NAMES.get(name, name):<10} "
-                f"{s['bias']:>+10.4f} {s['mad']:>10.4f} {s['rmse']:>10.4f} "
-                f"{s['iqr']:>10.4f} {s['median_aspcap_err']:>10.4f}"
-            )
-        lines.append(f"  {rule}")
-        print("\n".join(lines))
-
-    return report
-
-
-# ─────────────────────────────────────────────────────────────────
-# 3. VISUALISE
-# ─────────────────────────────────────────────────────────────────
-
-# ---- colour palette (publication-quality) ----
-_C_CORE   = "#2c7bb6"       # blue
-_C_ABUND  = "#d7191c"       # red
-_C_HIST   = "#636363"       # grey
-_C_UNITY  = "#1a1a1a"       # dark
-_C_BG     = "#fafafa"
-
-
-def _nice_label(name):
-    return PRETTY_NAMES.get(name, name)
-
-
-def _save(fig, save_dir, stem):
-    if save_dir is not None:
-        os.makedirs(save_dir, exist_ok=True)
-        for ext in ("png", "pdf"):
-            fig.savefig(os.path.join(save_dir, f"{stem}.{ext}"),
-                        dpi=200, bbox_inches="tight")
-
-
-# ---- (a) 1-to-1 scatter grid ----
-
-def plot_one_to_one(data, save_dir=None):
-    """23-panel grid: inferred vs true for every label."""
-    label_names = data["label_names"]
-    true        = data["true_labels"]
-    inferred    = data["inferred_labels"]
-    n_labels    = len(label_names)
-    n_cols      = 6
-    n_rows      = int(np.ceil(n_labels / n_cols))
-
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 3.2, n_rows * 3.2))
-    fig.patch.set_facecolor("white")
-    axes = axes.ravel()
-
-    for j in range(n_labels):
-        ax  = axes[j]
-        t   = true[:, j]
-        inf = inferred[:, j]
-        name = label_names[j]
-        c = _C_CORE if name in CORE_LABELS else _C_ABUND
-
-        ax.scatter(t, inf, s=12, alpha=0.65, edgecolors="none", c=c, zorder=2)
-
-        lo = min(t.min(), inf.min())
-        hi = max(t.max(), inf.max())
-        margin = 0.05 * (hi - lo) if hi > lo else 0.5
-        ax.plot([lo - margin, hi + margin], [lo - margin, hi + margin],
-                ls="--", lw=1, c=_C_UNITY, alpha=0.5, zorder=1)
-        ax.set_xlim(lo - margin, hi + margin)
-        ax.set_ylim(lo - margin, hi + margin)
-        ax.set_xlabel("ASPCAP", fontsize=8)
-        ax.set_ylabel("MAP", fontsize=8)
-        ax.set_title(_nice_label(name), fontsize=9, fontweight="bold")
-        ax.tick_params(labelsize=7)
-        ax.set_aspect("equal", adjustable="box")
-
-    for j in range(n_labels, len(axes)):
-        axes[j].set_visible(False)
-
-    fig.suptitle("MAP Inference — Inferred vs ASPCAP (True)", fontsize=14,
-                 fontweight="bold", y=1.01)
-    fig.tight_layout()
-    _save(fig, save_dir, "map_one_to_one")
-    return fig
-
-
-# ---- (b) residual histograms ----
-
-def plot_residual_histograms(data, save_dir=None):
-    """23-panel grid: residual (inferred − true) histogram per label."""
-    label_names = data["label_names"]
-    residuals   = data["residuals"]
-    n_labels    = len(label_names)
-    n_cols      = 6
-    n_rows      = int(np.ceil(n_labels / n_cols))
-
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 3.0, n_rows * 2.8))
-    fig.patch.set_facecolor("white")
-    axes = axes.ravel()
-
-    for j in range(n_labels):
-        ax   = axes[j]
-        r    = residuals[:, j]
-        name = label_names[j]
-        c = _C_CORE if name in CORE_LABELS else _C_ABUND
-
-        n_bins = max(10, min(50, int(np.sqrt(len(r)))))
-        ax.hist(r, bins=n_bins, color=c, alpha=0.75, edgecolor="white", linewidth=0.5)
-        ax.axvline(0, ls="--", lw=1.0, c=_C_UNITY, alpha=0.5)
-        ax.axvline(np.median(r), ls="-", lw=1.2, c="k", alpha=0.8, label=f"med={np.median(r):.3f}")
-
-        ax.set_xlabel("Residual", fontsize=8)
-        ax.set_title(_nice_label(name), fontsize=9, fontweight="bold")
-        ax.tick_params(labelsize=7)
-        ax.legend(fontsize=6, loc="upper right")
-        ax.yaxis.set_major_locator(MaxNLocator(integer=True))
-
-    for j in range(n_labels, len(axes)):
-        axes[j].set_visible(False)
-
-    fig.suptitle("MAP Inference — Residual Distributions (Inferred − ASPCAP)",
-                 fontsize=14, fontweight="bold", y=1.01)
-    fig.tight_layout()
-    _save(fig, save_dir, "map_residual_histograms")
-    return fig
-
-
-# ---- (c) bias + scatter bar chart ----
-
-def plot_bias_scatter_bars(data, save_dir=None):
-    """Horizontal bar chart: median bias ± MAD for every label."""
-    label_names = data["label_names"]
-    residuals   = data["residuals"]
-    n_labels    = len(label_names)
-
-    biases = np.array([np.median(residuals[:, j]) for j in range(n_labels)])
-    mads   = np.array([np.median(np.abs(residuals[:, j] - biases[j])) for j in range(n_labels)])
-
-    order = np.arange(n_labels)[::-1]
-
-    fig, ax = plt.subplots(figsize=(7, 0.45 * n_labels + 1.5))
-    fig.patch.set_facecolor("white")
-    colours = [_C_CORE if label_names[j] in CORE_LABELS else _C_ABUND for j in order]
-
-    ax.barh(range(n_labels), biases[order], xerr=mads[order],
-            color=colours, alpha=0.8, edgecolor="white", linewidth=0.5,
-            error_kw=dict(lw=1, capsize=3, capthick=1, ecolor="#333"))
-    ax.axvline(0, ls="-", lw=0.8, c=_C_UNITY, alpha=0.5)
-    ax.set_yticks(range(n_labels))
-    ax.set_yticklabels([_nice_label(label_names[j]) for j in order], fontsize=8)
-    ax.set_xlabel("Median bias  ±  MAD", fontsize=10)
-    ax.set_title("MAP Inference — Per-Label Bias & Scatter", fontsize=13, fontweight="bold")
-    ax.tick_params(labelsize=8)
-    fig.tight_layout()
-    _save(fig, save_dir, "map_bias_scatter_bars")
-    return fig
-
-
-# ---- (d) Teff-coloured residual map ----
-
-def plot_residual_vs_teff(data, save_dir=None):
-    """
-    For each abundance, scatter residual vs Teff  
-    to reveal temperature-dependent biases.
-    """
-    label_names = data["label_names"]
-    true        = data["true_labels"]
-    residuals   = data["residuals"]
-
-    teff_idx = label_names.index("TEFF")
-    teff     = true[:, teff_idx]
-
-    abund_indices = [j for j, n in enumerate(label_names) if n in ABUND_LABELS]
-    n = len(abund_indices)
-    n_cols = 5
-    n_rows = int(np.ceil(n / n_cols))
-
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 3.2, n_rows * 2.8),
-                              sharey=False)
-    fig.patch.set_facecolor("white")
-    axes = axes.ravel()
-
-    for k, j in enumerate(abund_indices):
-        ax   = axes[k]
-        r    = residuals[:, j]
-        name = label_names[j]
-        sc = ax.scatter(teff, r, c=teff, cmap="RdYlBu_r", s=10, alpha=0.7,
-                        edgecolors="none")
-        ax.axhline(0, ls="--", lw=0.8, c=_C_UNITY, alpha=0.4)
-        ax.set_xlabel(r"$T_{\rm eff}$ [K]", fontsize=7)
-        ax.set_ylabel("Residual", fontsize=7)
-        ax.set_title(_nice_label(name), fontsize=9, fontweight="bold")
-        ax.tick_params(labelsize=6)
-
-    for k in range(n, len(axes)):
-        axes[k].set_visible(False)
-
-    fig.suptitle("MAP Residuals vs $T_{\\rm eff}$  — Temperature-Dependent Biases",
-                 fontsize=13, fontweight="bold", y=1.01)
-    fig.tight_layout()
-    _save(fig, save_dir, "map_residual_vs_teff")
-    return fig
-
-
-# ---- (e) residual heatmap (label × star) ----
-
-def plot_residual_heatmap(data, save_dir=None):
-    """
-    Heatmap of absolute residuals:  rows = labels,  cols = stars.
-    Helps spot outlier stars and systematically hard labels.
-    """
-    label_names = data["label_names"]
-    residuals   = data["residuals"]
-    n_stars     = data["n_stars"]
-
-    # Normalise residuals by MAD per label for comparability
-    mads = np.array([np.median(np.abs(residuals[:, j] - np.median(residuals[:, j])))
-                     for j in range(len(label_names))])
-    mads = np.where(mads < 1e-8, 1.0, mads)
-    normed = np.abs(residuals) / mads[None, :]    # (n_stars, n_labels)
-
-    fig, ax = plt.subplots(figsize=(max(6, 0.15 * n_stars + 2), 7))
-    fig.patch.set_facecolor("white")
-
-    im = ax.imshow(normed.T, aspect="auto", cmap="inferno",
-                   interpolation="nearest", vmin=0, vmax=5)
-    ax.set_yticks(range(len(label_names)))
-    ax.set_yticklabels([_nice_label(n) for n in label_names], fontsize=7)
-    ax.set_xlabel("Star index", fontsize=10)
-    ax.set_title("MAP |Residuals|  /  MAD   (per label)", fontsize=13, fontweight="bold")
-    cbar = fig.colorbar(im, ax=ax, shrink=0.8, pad=0.02)
-    cbar.set_label("× MAD", fontsize=9)
-    fig.tight_layout()
-    _save(fig, save_dir, "map_residual_heatmap")
-    return fig
-
-
-# ---- (f) wall-time histogram ----
-
-def plot_wall_time(data, save_dir=None):
-    """Histogram of per-star wall-clock time."""
-    wall = data["wall_seconds"]
-
-    fig, ax = plt.subplots(figsize=(6, 3.5))
-    fig.patch.set_facecolor("white")
-    ax.hist(wall, bins=max(10, min(40, len(wall) // 3)),
-            color="#636363", alpha=0.8, edgecolor="white", linewidth=0.5)
-    ax.axvline(np.median(wall), ls="-", lw=1.5, c=_C_CORE,
-               label=f"median = {np.median(wall):.2f} s")
-    ax.set_xlabel("Wall time per star [s]", fontsize=10)
-    ax.set_ylabel("Count", fontsize=10)
-    ax.set_title("MAP Inference — Per-Star Timing", fontsize=13, fontweight="bold")
-    ax.legend(fontsize=9)
-    fig.tight_layout()
-    _save(fig, save_dir, "map_wall_time")
-    return fig
-
-
-# ---- (g) RMSE comparison: MAP vs ASPCAP pipeline errors ----
-
-def plot_rmse_vs_aspcap(data, save_dir=None):
-    """
-    Side-by-side bar chart: RMSE of MAP residuals vs median
-    ASPCAP pipeline error, per label.
-    """
-    label_names = data["label_names"]
-    residuals   = data["residuals"]
-    aspcap_err  = data["aspcap_errors"]
-    n_labels    = len(label_names)
-
-    rmses       = np.array([np.sqrt(np.mean(residuals[:, j]**2)) for j in range(n_labels)])
-    med_aspcap  = np.array([np.median(aspcap_err[:, j]) for j in range(n_labels)])
-
-    x = np.arange(n_labels)
-    w = 0.35
-
-    fig, ax = plt.subplots(figsize=(14, 5))
-    fig.patch.set_facecolor("white")
-    ax.bar(x - w/2, rmses, w, label="MAP RMSE", color=_C_CORE, alpha=0.85, edgecolor="white")
-    ax.bar(x + w/2, med_aspcap, w, label="ASPCAP median σ", color=_C_ABUND, alpha=0.65, edgecolor="white")
-
-    ax.set_xticks(x)
-    ax.set_xticklabels([_nice_label(n) for n in label_names], fontsize=7, rotation=45, ha="right")
-    ax.set_ylabel("Error scale", fontsize=10)
-    ax.set_title("MAP RMSE  vs  ASPCAP Pipeline Errors", fontsize=13, fontweight="bold")
-    ax.legend(fontsize=9)
-    fig.tight_layout()
-    _save(fig, save_dir, "map_rmse_vs_aspcap")
-    return fig
-
-
-# ---- master function ----
-
-def visualise_map_results(data: dict, save_dir: str = None) -> dict:
-    """
-    Generate all diagnostic plots.
-
-    Parameters
-    ----------
-    data      : dict returned by load_map_results()
-    save_dir  : if not None, each figure is saved as PNG + PDF here
-
-    Returns
-    -------
-    dict  name → matplotlib.figure.Figure
-    """
-    figs = {}
-    figs["one_to_one"]           = plot_one_to_one(data, save_dir)
-    figs["residual_histograms"]  = plot_residual_histograms(data, save_dir)
-    figs["bias_scatter_bars"]    = plot_bias_scatter_bars(data, save_dir)
-    figs["residual_vs_teff"]     = plot_residual_vs_teff(data, save_dir)
-    figs["residual_heatmap"]     = plot_residual_heatmap(data, save_dir)
-    figs["wall_time"]            = plot_wall_time(data, save_dir)
-    figs["rmse_vs_aspcap"]       = plot_rmse_vs_aspcap(data, save_dir)
-
-    if save_dir:
-        print(f"\n  📊  7 figures saved to {save_dir}/")
-    return figs
-
-
-
-def flag_outliers(data, sigma_thresh=10.0):
-    """
-    Flag outlier stars using a per-label robust z-score.
-
-    A star is an outlier if |residual - median| > sigma_thresh * MAD
-    for ANY label.  Returns a boolean mask (n_stars,) and a detailed
-    per-label breakdown.
-
-    Parameters
-    ----------
-    data          : dict from load_map_results()
-    sigma_thresh  : MAD-based sigma threshold (default 3.0)
-
-    Returns
-    -------
-    is_outlier    : (n_stars,) bool array
-    outlier_info  : dict label_name → {
-                        'z_scores':  (n_stars,) robust z-scores,
-                        'flagged':   (n_stars,) bool per this label,
-                        'n_flagged': int,
-                    }
-    """
-    label_names = data["label_names"]
-    residuals   = data["residuals"]      # (N, 23)
-    n_stars     = data["n_stars"]
-    n_labels    = len(label_names)
-
-    is_outlier  = np.zeros(n_stars, dtype=bool)
-    outlier_info = {}
-
-    for j, name in enumerate(label_names):
-        r   = residuals[:, j]
-        med = np.median(r)
-        mad = np.median(np.abs(r - med))
-        mad = max(mad, 1e-8)             # avoid division by zero
-        z   = np.abs(r - med) / (1.4826 * mad)   # 1.4826 scales MAD → σ equivalent
-        flagged = z >sigma_thresh
-        is_outlier |= flagged
-        outlier_info[name] = {
-            "z_scores":  z,
-            "flagged":   flagged,
-            "n_flagged": int(flagged.sum()),
-        }
-
-    print(f"\n  Outlier summary (>{sigma_thresh:.1f}σ on any label):")
-    print(f"  Total stars flagged: {is_outlier.sum()} / {n_stars} "
-          f"({100*is_outlier.sum()/n_stars:.1f}%)")
-    print(f"  {'Label':<10} {'N flagged':>10}")
-    print(f"  {'─'*22}")
-    for name in CORE_LABELS + ABUND_LABELS:
-        if name in outlier_info:
-            print(f"  {PRETTY_NAMES.get(name,name):<10} {outlier_info[name]['n_flagged']:>10}")
-
-    return is_outlier, outlier_info
-
-
-def report_clean_vs_outlier(data, is_outlier):
-    """
-    Print side-by-side RMSE tables for clean stars vs outlier stars.
-    This reveals whether the large RMSE is driven by outliers or is
-    a genuine model weakness.
-    """
-    label_names = data["label_names"]
-    residuals   = data["residuals"]
-
-    clean_mask   = ~is_outlier
-    n_clean      = clean_mask.sum()
-    n_outlier    = is_outlier.sum()
-
-    print(f"\n  ┌──────────────────────────────────────────────────────────┐")
-    print(f"  │  Clean: {n_clean} stars    Outlier: {n_outlier} stars" +
-          " " * (40 - len(f"  Clean: {n_clean} stars    Outlier: {n_outlier} stars")) + "│")
-    print(f"  ├──────────────────────────────────────────────────────────┤")
-    print(f"  │ {'Label':<10} {'RMSE clean':>12} {'RMSE outlier':>14} {'Ratio':>8}   │")
-    print(f"  ├──────────────────────────────────────────────────────────┤")
-
-    for j, name in enumerate(label_names):
-        r_c = residuals[clean_mask, j]
-        r_o = residuals[is_outlier, j]
-        rmse_c = np.sqrt(np.mean(r_c**2)) if len(r_c) > 0 else 0
-        rmse_o = np.sqrt(np.mean(r_o**2)) if len(r_o) > 0 else 0
-        ratio  = rmse_o / rmse_c if rmse_c > 1e-10 else float('inf')
-        pretty = PRETTY_NAMES.get(name, name)
-        print(f"  │ {pretty:<10} {rmse_c:>12.4f} {rmse_o:>14.4f} {ratio:>7.1f}×  │")
-
-    print(f"  └──────────────────────────────────────────────────────────┘")
-
-
-def plot_outlier_diagnostics(data, is_outlier, outlier_info, save_dir=None):
-    """
-    Generate 4 diagnostic plots to distinguish model weakness from bad data.
-
-    Plot 1 — Outlier flagged 1:1 scatter (clean=blue, outlier=red)
-    Plot 2 — Teff residual vs abundance residual (cascade check)
-    Plot 3 — ivar-weighted SNR proxy for outlier vs clean (bad data check)
-    Plot 4 — Robust z-score heatmap (which labels fail for which stars)
-    """
-    label_names = data["label_names"]
-    true        = data["true_labels"]
-    inferred    = data["inferred_labels"]
-    residuals   = data["residuals"]
-    aspcap_err  = data["aspcap_errors"]
-    n_labels    = len(label_names)
-    clean_mask  = ~is_outlier
-
-    def _save(fig, stem):
-        if save_dir:
-            os.makedirs(save_dir, exist_ok=True)
-            fig.savefig(os.path.join(save_dir, f"{stem}.png"), dpi=200, bbox_inches="tight")
-            fig.savefig(os.path.join(save_dir, f"{stem}.pdf"), dpi=200, bbox_inches="tight")
-
-    # ── Plot 1: Flagged 1:1 scatter ──────────────────────────────
-    n_cols = 6
-    n_rows = int(np.ceil(n_labels / n_cols))
-    fig1, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols*3.2, n_rows*3.2))
-    fig1.patch.set_facecolor("white")
-    axes = axes.ravel()
-
-    for j in range(n_labels):
-        ax = axes[j]
-        t, inf = true[:, j], inferred[:, j]
-
-        # clean
-        ax.scatter(t[clean_mask], inf[clean_mask], s=8, alpha=0.5,
-                   c="#2c7bb6", edgecolors="none", label="clean", zorder=2)
-        # outlier
-        ax.scatter(t[is_outlier], inf[is_outlier], s=18, alpha=0.85,
-                   c="#d7191c", edgecolors="k", linewidths=0.3,
-                   marker="x", label="outlier", zorder=3)
-
-        lo = min(t.min(), inf.min()); hi = max(t.max(), inf.max())
-        mg = 0.05*(hi-lo) if hi > lo else 0.5
-        ax.plot([lo-mg, hi+mg], [lo-mg, hi+mg], "--", lw=0.8, c="#333", alpha=0.4)
-        ax.set_xlim(lo-mg, hi+mg); ax.set_ylim(lo-mg, hi+mg)
-        ax.set_title(PRETTY_NAMES.get(label_names[j], label_names[j]), fontsize=9, fontweight="bold")
-        ax.tick_params(labelsize=6)
-        ax.set_aspect("equal", adjustable="box")
-        if j == 0: ax.legend(fontsize=6, loc="upper left")
-
-    for j in range(n_labels, len(axes)): axes[j].set_visible(False)
-    fig1.suptitle("1:1 Scatter — Clean (blue) vs Outlier (red ×)", fontsize=14, fontweight="bold", y=1.01)
-    fig1.tight_layout()
-    _save(fig1, "outlier_scatter")
-
-    # ── Plot 2: Teff residual vs abundance residuals ─────────────
-    # If abundance errors correlate with Teff errors, it's a cascade
-    # problem (model issue).  If they DON'T, it's likely bad data.
-    teff_idx = label_names.index("TEFF")
-    teff_res = np.abs(residuals[:, teff_idx])
-
-    abund_idx_list = [j for j, n in enumerate(label_names) if n in ABUND_LABELS]
-    n = len(abund_idx_list)
-    n_c2 = 5; n_r2 = int(np.ceil(n / n_c2))
-
-    fig2, axes2 = plt.subplots(n_r2, n_c2, figsize=(n_c2*3.0, n_r2*2.8))
-    fig2.patch.set_facecolor("white")
-    axes2 = axes2.ravel()
-
-    for k, j in enumerate(abund_idx_list):
-        ax = axes2[k]
-        abund_res = np.abs(residuals[:, j])
-        ax.scatter(teff_res[clean_mask], abund_res[clean_mask], s=6, alpha=0.4,
-                   c="#2c7bb6", edgecolors="none")
-        ax.scatter(teff_res[is_outlier], abund_res[is_outlier], s=14, alpha=0.8,
-                   c="#d7191c", marker="x", linewidths=0.6)
-
-        # correlation coefficient
-        rho = np.corrcoef(teff_res, abund_res)[0, 1]
-        ax.set_title(f"{PRETTY_NAMES.get(label_names[j], label_names[j])}  ρ={rho:.2f}",
-                     fontsize=8, fontweight="bold")
-        ax.set_xlabel("|ΔTeff| [K]", fontsize=7)
-        ax.set_ylabel("|Δabund|", fontsize=7)
-        ax.tick_params(labelsize=6)
-
-    for k in range(n, len(axes2)): axes2[k].set_visible(False)
-    fig2.suptitle("Cascade Check — |Teff residual| vs |Abundance residual|\n"
-                  "High ρ → model cascade (Stage 1 failure).  Low ρ → likely bad data.",
-                  fontsize=12, fontweight="bold", y=1.03)
-    fig2.tight_layout()
-    _save(fig2, "outlier_cascade_check")
-
-    # ── Plot 3: ASPCAP error of outlier vs clean ──────────────────
-    # If outlier stars have much larger ASPCAP errors, they are bad data.
-    fig3, ax3 = plt.subplots(figsize=(12, 5))
-    fig3.patch.set_facecolor("white")
-
-    x = np.arange(n_labels)
-    w = 0.35
-    med_clean   = np.array([np.median(aspcap_err[clean_mask, j]) for j in range(n_labels)])
-    med_outlier = np.array([np.median(aspcap_err[is_outlier, j]) for j in range(n_labels)])
-
-    ax3.bar(x - w/2, med_clean, w, label="Clean stars", color="#2c7bb6", alpha=0.8, edgecolor="white")
-    ax3.bar(x + w/2, med_outlier, w, label="Outlier stars", color="#d7191c", alpha=0.7, edgecolor="white")
-    ax3.set_xticks(x)
-    ax3.set_xticklabels([PRETTY_NAMES.get(n, n) for n in label_names], fontsize=7, rotation=45, ha="right")
-    ax3.set_ylabel("Median ASPCAP reported error", fontsize=10)
-    ax3.set_title("Bad Data Check — ASPCAP Errors: Clean vs Outlier\n"
-                  "If outlier bars are much taller → bad input data, not model failure",
-                  fontsize=12, fontweight="bold")
-    ax3.legend(fontsize=9)
-    fig3.tight_layout()
-    _save(fig3, "outlier_aspcap_error_compare")
-
-    # ── Plot 4: Z-score heatmap (label × star) ───────────────────
-    # Only show the outlier stars for readability
-    outlier_indices = np.where(is_outlier)[0]
-    if len(outlier_indices) > 0:
-        z_matrix = np.column_stack([outlier_info[name]["z_scores"][outlier_indices]
-                                    for name in label_names])  # (n_outlier, n_labels)
-
-        fig4, ax4 = plt.subplots(figsize=(max(6, 0.2*len(outlier_indices)+2), 7))
-        fig4.patch.set_facecolor("white")
-        im = ax4.imshow(z_matrix.T, aspect="auto", cmap="YlOrRd",
-                        interpolation="nearest", vmin=0, vmax=8)
-        ax4.set_yticks(range(n_labels))
-        ax4.set_yticklabels([PRETTY_NAMES.get(n, n) for n in label_names], fontsize=7)
-        ax4.set_xlabel("Outlier star index", fontsize=10)
-        ax4.set_xticks(range(len(outlier_indices)))
-        ax4.set_xticklabels(outlier_indices, fontsize=5, rotation=90)
-        ax4.set_title("Robust Z-Score Heatmap (outlier stars only)\n"
-                      "Columns with ALL rows hot → bad star.  "
-                      "Rows always hot → model-weak label.",
-                      fontsize=11, fontweight="bold")
-        cbar = fig4.colorbar(im, ax=ax4, shrink=0.8, pad=0.02)
-        cbar.set_label("Robust z-score", fontsize=9)
-        fig4.tight_layout()
-        _save(fig4, "outlier_zscore_heatmap")
-    else:
-        fig4 = None
-
-    figs = {"scatter": fig1, "cascade": fig2, "aspcap_compare": fig3, "z_heatmap": fig4}
-    if save_dir:
-        print(f"\n  📊  Outlier diagnostic figures saved to {save_dir}/")
-    return figs
-
-# ─────────────────────────────────────────────────────────────────
-# CLI
-# ─────────────────────────────────────────────────────────────────
-
-def main(results_path,save_path):
-    
-    data   = load_map_results(results_path)
-    report = report_map_results(data)
-    figs   = visualise_map_results(data, save_dir=save_path)
-
-    print(f"\nDone. {len(figs)} figures generated.")
-    
-    # ---- Outlier analysis ----
-    is_outlier, outlier_info = flag_outliers(data, sigma_thresh=3.0)
-    report_clean_vs_outlier(data, is_outlier)
-    outlier_figs = plot_outlier_diagnostics(data, is_outlier, outlier_info,
-                                     save_dir=save_path)
-
-
-
-if __name__ == "__main__":
-    main("/kaggle/working/map_results/results.npz","visresults")
+# [Rest of your notebook's loading and visualization functions follows...]
