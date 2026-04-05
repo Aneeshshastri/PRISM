@@ -94,6 +94,7 @@ def load_map_results(path: str) -> dict:
                    for s in raw["label_names"]]
     true      = raw["true_labels"].astype(np.float64)
     inferred  = raw["inferred_labels"].astype(np.float64)
+    inf_err   = raw["inferred_errors"].astype(np.float64) if "inferred_errors" in raw else np.zeros_like(inferred)
     aspcap_err = raw["aspcap_errors"].astype(np.float64)
     wall      = raw["wall_seconds"].astype(np.float64)
     gidx      = raw["global_indices"]
@@ -104,6 +105,7 @@ def load_map_results(path: str) -> dict:
         "n_labels":        len(label_names),
         "true_labels":     true,
         "inferred_labels": inferred,
+        "inferred_errors": inf_err,
         "residuals":       inferred - true,
         "aspcap_errors":   aspcap_err,
         "wall_seconds":    wall,
@@ -131,30 +133,41 @@ def report_map_results(data: dict, print_report: bool = True) -> dict:
     label_names = data["label_names"]
     residuals   = data["residuals"]
     aspcap_err  = data["aspcap_errors"]
+    inf_err     = data["inferred_errors"]
     n_stars     = data["n_stars"]
     wall        = data["wall_seconds"]
 
     report = {}
     for j, name in enumerate(label_names):
         r = residuals[:, j]
+        ie = inf_err[:, j]
+        ae = aspcap_err[:, j]
+        
+        # Safety for zero errors
+        safe_ie = np.where(ie > 1e-10, ie, 1e-10)
+        ratios = ae / safe_ie
+        
         report[name] = {
             "bias":              np.median(r),
             "mad":               np.median(np.abs(r - np.median(r))),
             "rmse":              np.sqrt(np.mean(r**2)),
-            "iqr":               _iqr(r),
-            "median_aspcap_err": np.median(aspcap_err[:, j]),
+            "sigma_rmse":        np.sqrt(np.mean(ie**2)),
+            "sigma_mad":         np.median(np.abs(ie - np.median(ie))),
+            "ratio":             np.median(ratios),
+            "median_aspcap_err": np.median(ae),
+            "median_model_err":  np.median(ie),
             "n_stars":           n_stars,
         }
 
     if print_report:
-        hdr  = f"{'Label':<10} {'Bias':>10} {'MAD':>10} {'RMSE':>10} {'IQR':>10} {'ASPCAP σ':>10}"
+        hdr  = f"{'Label':<10} {'Bias':>8} {'MAD':>8} {'RMSE':>8} {'Mod-σ':>8} {'σ-MAD':>8} {'Ratio':>6}"
         rule = "─" * len(hdr)
         lines = [
             "",
-            "╔══════════════════════════════════════════════════════════════════╗",
-            "║            MAP Results — Summary Statistics                     ║",
-            f"║  {n_stars} stars,  median wall-time = {np.median(wall):.2f} s/star{' '*(21 - len(f'{np.median(wall):.2f}'))}║",
-            "╚══════════════════════════════════════════════════════════════════╝",
+            "╔═══════════════════════════════════════════════════════════════╗",
+            "║            MAP Results — Laplace Uncertainty Summary           ║",
+            f"║  {n_stars} stars,  median wall-time = {np.median(wall):.2f} s/star{' '*(20 - len(f'{np.median(wall):.2f}'))}║",
+            "╚═══════════════════════════════════════════════════════════════╝",
             "",
             "  Core physics parameters",
             f"  {rule}",
@@ -162,13 +175,12 @@ def report_map_results(data: dict, print_report: bool = True) -> dict:
             f"  {rule}",
         ]
         for name in CORE_LABELS:
-            if name not in report:
-                continue
+            if name not in report: continue
             s = report[name]
             lines.append(
                 f"  {PRETTY_NAMES.get(name, name):<10} "
-                f"{s['bias']:>+10.4f} {s['mad']:>10.4f} {s['rmse']:>10.4f} "
-                f"{s['iqr']:>10.4f} {s['median_aspcap_err']:>10.4f}"
+                f"{s['bias']:>8.3f} {s['mad']:>8.3f} {s['rmse']:>8.3f} "
+                f"{s['sigma_rmse']:>8.3f} {s['sigma_mad']:>8.3f} {s['ratio']:>6.1f}x"
             )
         lines += [
             f"  {rule}",
@@ -179,13 +191,12 @@ def report_map_results(data: dict, print_report: bool = True) -> dict:
             f"  {rule}",
         ]
         for name in ABUND_LABELS:
-            if name not in report:
-                continue
+            if name not in report: continue
             s = report[name]
             lines.append(
                 f"  {PRETTY_NAMES.get(name, name):<10} "
-                f"{s['bias']:>+10.4f} {s['mad']:>10.4f} {s['rmse']:>10.4f} "
-                f"{s['iqr']:>10.4f} {s['median_aspcap_err']:>10.4f}"
+                f"{s['bias']:>8.3f} {s['mad']:>8.3f} {s['rmse']:>8.3f} "
+                f"{s['sigma_rmse']:>8.3f} {s['sigma_mad']:>8.3f} {s['ratio']:>6.1f}x"
             )
         lines.append(f"  {rule}")
         print("\n".join(lines))

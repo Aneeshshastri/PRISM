@@ -309,6 +309,97 @@ for idx in ABUND_INDICES:
     if s.sum() < 10: s = np.ones(N_PIXELS, np.float32)
     ELEMENT_PIXEL_MASKS[idx] = tf.constant(s, tf.float32)
 
+@tf.function(jit_compile=True)
+def compute_uncertainties_core(theta_unc_batch, obs_flux, obs_ivar, fixed_abund, cnn_mu, cnn_std):
+    """
+    Laplace approximation for 9D core physics.
+    """
+    n_params = 9
+    core_cnn_mu = tf.gather(cnn_mu, CORE_INDICES, axis=1)
+    core_cnn_std = tf.gather(cnn_std, CORE_INDICES, axis=1)
+
+    def single_star_hessian(args):
+        theta_unc, flux, ivar, f_abund, c_mu, c_std = args
+        with tf.GradientTape() as outer_tape:
+            outer_tape.watch(theta_unc)
+            with tf.GradientTape() as inner_tape:
+                inner_tape.watch(theta_unc)
+                theta_phys = _core_bij.forward(theta_unc)
+                
+                parts = []
+                for i in range(23):
+                    if i in CORE_INDICES:
+                        ci = CORE_INDICES.index(i)
+                        parts.append(tf.reshape(theta_phys[ci], [1]))
+                    else:
+                        ai = ABUND_INDICES.index(i)
+                        parts.append(tf.reshape(f_abund[ai], [1]))
+                full_23 = tf.concat(parts, axis=0)
+                
+                labels_27 = get_27_features(tf.expand_dims(full_23, 0))
+                labels_norm = (labels_27 - MEAN_TENSOR) / STD_TENSOR
+                model_flux = tf.cast(model_pure_fp32(labels_norm, training=False), tf.float32)
+                model_flux = tf.squeeze(model_flux)
+
+                safe_flux = tf.where(tf.math.is_finite(flux), flux, 0.0)
+                safe_ivar = tf.where(tf.math.is_finite(ivar) & tf.math.is_finite(flux), ivar, 0.0)
+                safe_ivar = 1.0 / (1.0 / (safe_ivar + 1e-12) + 1e-5)
+                mask = tf.cast((safe_flux > 1e-3) & (safe_flux < 1.3) & (safe_ivar > 0.0), tf.float32)
+
+                chi2 = tf.reduce_sum(tf.square(safe_flux - model_flux) * safe_ivar * mask)
+                prior = tf.reduce_sum(tf.square((theta_phys - c_mu) / c_std))
+                loss = 0.5 * chi2 + PRIOR_WEIGHT * 0.5 * prior
+            grad = inner_tape.gradient(loss, theta_unc)
+        hess = outer_tape.jacobian(grad, theta_unc)
+        hess_reg = hess + tf.eye(n_params) * 1e-6
+        cov_unc = tf.linalg.inv(hess_reg)
+        var_unc = tf.abs(tf.linalg.diag_part(cov_unc))
+        
+        s = tf.nn.sigmoid(theta_unc)
+        jacobian_diag = s * (1.0 - s) * (_core_high - _core_low)
+        return tf.sqrt(var_unc) * jacobian_diag
+
+    return tf.vectorized_map(single_star_hessian, (theta_unc_batch, obs_flux, obs_ivar, fixed_abund, core_cnn_mu, core_cnn_std))
+
+@tf.function(jit_compile=True)
+def compute_uncertainties_element(theta_unc_1d, obs_flux, obs_ivar, fixed_full_23, 
+                                 elem_col, pixel_mask, elem_lo, elem_hi, 
+                                 elem_cnn_mu, elem_cnn_std):
+    """
+    Laplace approximation for 1D single element.
+    """
+    lo = tf.reshape(elem_lo, [1]); hi = tf.reshape(elem_hi, [1])
+    bij = tfb.Chain([tfb.Shift(lo), tfb.Scale(hi - lo), tfb.Sigmoid()])
+
+    def single_star_hessian(args):
+        theta_unc, flux, ivar, f_23, c_mu, c_std = args
+        with tf.GradientTape() as tape:
+            tape.watch(theta_unc)
+            with tf.GradientTape() as inner_tape:
+                inner_tape.watch(theta_unc)
+                theta_phys = bij.forward(theta_unc)
+                indices = tf.constant([[0, elem_col]])
+                full_spliced = tf.tensor_scatter_nd_update(tf.expand_dims(f_23, 0), indices, theta_phys)
+                labels_27 = get_27_features(full_spliced)
+                labels_norm = (labels_27 - MEAN_TENSOR) / STD_TENSOR
+                model_flux = tf.cast(model_pure_fp32(labels_norm, training=False), tf.float32)
+                model_flux = tf.squeeze(model_flux)
+                safe_flux = tf.where(tf.math.is_finite(flux), flux, 0.0)
+                safe_ivar = tf.where(tf.math.is_finite(ivar) & tf.math.is_finite(flux), ivar, 0.0)
+                safe_ivar = 1.0 / (1.0 / (safe_ivar + 1e-12) + 1e-5)
+                mask = tf.cast((safe_flux > 1e-3) & (safe_flux < 1.3) & (safe_ivar > 0.0), tf.float32) * pixel_mask
+                chi2 = tf.reduce_sum(tf.square(safe_flux - model_flux) * safe_ivar * mask)
+                prior = tf.reduce_sum(tf.square((theta_phys - c_mu) / c_std))
+                loss = 0.5 * chi2 + PRIOR_WEIGHT * 0.5 * prior
+            grad = inner_tape.gradient(loss, theta_unc)
+        hess = tape.gradient(grad, theta_unc)
+        var_unc = 1.0 / tf.abs(hess + 1e-6)
+        s = tf.nn.sigmoid(theta_unc)
+        jacobian = s * (1.0 - s) * (hi - lo)
+        return tf.sqrt(var_unc[0]) * jacobian[0]
+
+    return tf.vectorized_map(single_star_hessian, (theta_unc_1d, obs_flux, obs_ivar, fixed_full_23, elem_cnn_mu, elem_cnn_std))
+
 # ================================================================
 # FEATURE ENGINEERING
 # ================================================================
@@ -466,6 +557,43 @@ def map_optimize_element(theta_unc_1d, obs_flux, obs_ivar,
 
     return bij.forward(theta)[:, 0]
 
+@tf.function(jit_compile=True)
+def compute_uncertainties_joint(theta_unc_batch, obs_flux, obs_ivar, cnn_mu, cnn_std):
+    """
+    Laplace approximation for 23D joint MAP.
+    """
+    batch_size = tf.shape(theta_unc_batch)[0]
+    n_params = 23
+    
+    def single_star_hessian(args):
+        theta_unc, flux, ivar, c_mu, c_std = args
+        with tf.GradientTape() as outer_tape:
+            outer_tape.watch(theta_unc)
+            with tf.GradientTape() as inner_tape:
+                inner_tape.watch(theta_unc)
+                theta_phys = _joint_bij.forward(theta_unc)
+                labels_27 = get_27_features(tf.expand_dims(theta_phys, 0))
+                labels_norm = (labels_27 - MEAN_TENSOR) / STD_TENSOR
+                model_flux = tf.cast(model_pure_fp32(labels_norm, training=False), tf.float32)
+                model_flux = tf.squeeze(model_flux)
+                safe_flux = tf.where(tf.math.is_finite(flux), flux, 0.0)
+                safe_ivar = tf.where(tf.math.is_finite(ivar) & tf.math.is_finite(flux), ivar, 0.0)
+                safe_ivar = 1.0 / (1.0 / (safe_ivar + 1e-12) + 1e-5)
+                mask = tf.cast((safe_flux > 1e-3) & (safe_flux < 1.3) & (safe_ivar > 0.0), tf.float32)
+                chi2 = tf.reduce_sum(tf.square(safe_flux - model_flux) * safe_ivar * mask)
+                prior = tf.reduce_sum(tf.square((theta_phys - c_mu) / c_std))
+                loss = 0.5 * chi2 + PRIOR_WEIGHT * 0.5 * prior
+            grad = inner_tape.gradient(loss, theta_unc)
+        hess = outer_tape.jacobian(grad, theta_unc)
+        hess_reg = hess + tf.eye(n_params) * 1e-6
+        cov_unc = tf.linalg.inv(hess_reg)
+        var_unc = tf.abs(tf.linalg.diag_part(cov_unc))
+        s = tf.nn.sigmoid(theta_unc)
+        jacobian_diag = s * (1.0 - s) * (bounds_high - bounds_low)
+        return tf.sqrt(var_unc) * jacobian_diag
+
+    return tf.vectorized_map(single_star_hessian, (theta_unc_batch, obs_flux, obs_ivar, cnn_mu, cnn_std))
+
 # ================================================================
 # CHECKPOINT / RESULTS
 # ================================================================
@@ -473,11 +601,11 @@ def map_optimize_element(theta_unc_1d, obs_flux, obs_ivar,
 def load_checkpoint():
     fresh = {
         'global_indices': [], 'true_labels': [], 'inferred_labels': [],
-        'aspcap_errors': [], 'wall_seconds': [],
+        'inferred_errors': [], 'aspcap_errors': [], 'wall_seconds': [],
     }
     if os.path.exists(CHECKPOINT_PATH):
         data = np.load(CHECKPOINT_PATH, allow_pickle=True)
-        results = {k: list(data[k]) for k in fresh}
+        results = {k: list(data[k]) if k in data else [] for k in fresh}
         n_done = len(results['global_indices'])
         print(f"  Resuming: {n_done} stars done.")
         return results, n_done
@@ -555,20 +683,31 @@ def run_inference_pipeline(test_indices, true_labels_norm, aspcap_errors,
             core_init_unc, obs_flux_tf, obs_ivar_tf,
             fixed_abund, cnn_mu_tf, cnn_sig_tf
         )
+        
+        # Core Uncertainties (Laplace)
+        core_final_unc = _core_inv.forward(core_result)
+        core_errors = compute_uncertainties_core(
+            core_final_unc, obs_flux_tf, obs_ivar_tf,
+            fixed_abund, cnn_mu_tf, cnn_sig_tf
+        )
+        
         t_core = time.time() - t0
-        print(f"    S1 core MAP: {t_core:.2f}s")
+        print(f"    S1 core MAP + Laplace: {t_core:.2f}s")
 
         # Build fixed_23 with core results
         fixed_23 = cnn_mu.copy()
         core_np = core_result.numpy()
+        core_err_np = core_errors.numpy()
         for ci, gi in enumerate(CORE_INDICES):
             fixed_23[:, gi] = core_np[:, ci]
 
         # Stage 2: Element MAP
         t0 = time.time()
         elem_results = np.zeros((BATCH_SIZE_STARS, N_LABELS_RAW), np.float32)
+        elem_errors  = np.zeros((BATCH_SIZE_STARS, N_LABELS_RAW), np.float32)
         for ci, gi in enumerate(CORE_INDICES):
             elem_results[:, gi] = core_np[:, ci]
+            elem_errors[:, gi]  = core_err_np[:, ci]
 
         for ai, elem_idx in enumerate(ABUND_INDICES):
             elem_init_phys = cnn_mu[:, elem_idx:elem_idx+1]
@@ -576,8 +715,7 @@ def run_inference_pipeline(test_indices, true_labels_norm, aspcap_errors,
             hi_val = upper_bounds[elem_idx]
             elem_init_phys = np.clip(elem_init_phys, lo_val + margin, hi_val - margin)
 
-            lo_tf = tf.constant(lo_val, tf.float32)
-            hi_tf = tf.constant(hi_val, tf.float32)
+            lo_tf = tf.constant(lo_val, tf.float32); hi_tf = tf.constant(hi_val, tf.float32)
             inv_bij = tfb.Invert(tfb.Chain([
                 tfb.Shift(tf.reshape(lo_tf, [1])),
                 tfb.Scale(tf.reshape(hi_tf - lo_tf, [1])),
@@ -593,11 +731,24 @@ def run_inference_pipeline(test_indices, true_labels_norm, aspcap_errors,
                 cnn_mu_tf[:, elem_idx:elem_idx+1],
                 cnn_sig_tf[:, elem_idx:elem_idx+1],
             )
+            
+            # Element Uncertainties (Laplace)
+            e_final_unc = inv_bij.forward(e_result)
+            e_err = compute_uncertainties_element(
+                e_final_unc, obs_flux_tf, obs_ivar_tf,
+                tf.constant(fixed_23, tf.float32), elem_idx,
+                ELEMENT_PIXEL_MASKS[elem_idx],
+                lo_tf, hi_tf,
+                cnn_mu_tf[:, elem_idx:elem_idx+1],
+                cnn_sig_tf[:, elem_idx:elem_idx+1],
+            )
+            
             elem_results[:, elem_idx] = e_result.numpy()
+            elem_errors[:, elem_idx]  = e_err.numpy()
             fixed_23[:, elem_idx] = e_result.numpy()
 
         t_elem = time.time() - t0
-        print(f"    S2 elem MAP: {t_elem:.2f}s ({N_ABUND} elements)")
+        print(f"    S2 elem MAP + Laplace: {t_elem:.2f}s ({N_ABUND} elements)")
 
         elapsed = t_core + t_elem
 
@@ -607,6 +758,7 @@ def run_inference_pipeline(test_indices, true_labels_norm, aspcap_errors,
             results['global_indices'].append(global_idx)
             results['true_labels'].append(true_labels_physical[local_idx])
             results['inferred_labels'].append(elem_results[b])
+            results['inferred_errors'].append(elem_errors[b])
             results['aspcap_errors'].append(aspcap_errors[local_idx, :N_LABELS_RAW])
             results['wall_seconds'].append(elapsed / actual)
 
@@ -620,6 +772,132 @@ def run_inference_pipeline(test_indices, true_labels_norm, aspcap_errors,
     total_elapsed = time.time() - total_start
     print(f"\nAll {n_stars} stars done in {total_elapsed:.1f}s ({total_elapsed/60:.1f} min).")
     save_final_results(results)
+    return results
+
+@tf.function(jit_compile=True)
+def map_optimize_joint(theta_unc, obs_flux, obs_ivar, cnn_mu, cnn_std):
+    """
+    Batched Adam MAP for all 23 physics/abundance parameters simultaneously.
+    """
+    lr = tf.constant(LEARNING_RATE_CORE, tf.float32)
+    beta1 = tf.constant(0.9, tf.float32)
+    beta2 = tf.constant(0.999, tf.float32)
+    eps   = tf.constant(1e-7, tf.float32)
+    
+    m = tf.zeros_like(theta_unc)
+    v = tf.zeros_like(theta_unc)
+    theta = theta_unc
+
+    for step in tf.range(N_STEPS_CORE):
+        with tf.GradientTape() as tape:
+            tape.watch(theta)
+            theta_phys = _joint_bij.forward(theta)
+            labels_27 = get_27_features(theta_phys)
+            labels_norm = (labels_27 - MEAN_TENSOR) / STD_TENSOR
+            model_flux = tf.cast(model_pure_fp32(labels_norm, training=False), tf.float32)
+            model_flux = tf.squeeze(model_flux, axis=-1)
+
+            safe_flux = tf.where(tf.math.is_finite(obs_flux), obs_flux, 0.0)
+            safe_ivar = tf.where(tf.math.is_finite(obs_ivar) & tf.math.is_finite(obs_flux), obs_ivar, 0.0)
+            safe_ivar = 1.0 / (1.0 / (safe_ivar + 1e-12) + 1e-5)
+            mask = tf.cast((safe_flux > 1e-3) & (safe_flux < 1.3) & (safe_ivar > 0.0), tf.float32)
+
+            chi2 = tf.reduce_sum(tf.square(safe_flux - model_flux) * safe_ivar * mask, axis=1)
+            prior = tf.reduce_sum(tf.square((theta_phys - cnn_mu) / cnn_std), axis=1)
+            loss = tf.reduce_mean(0.5 * chi2 + PRIOR_WEIGHT * 0.5 * prior)
+
+        grad = tape.gradient(loss, theta)
+        t_f = tf.cast(step + 1, tf.float32)
+        m = beta1 * m + (1.0 - beta1) * grad
+        v = beta2 * v + (1.0 - beta2) * tf.square(grad)
+        m_hat = m / (1.0 - tf.pow(beta1, t_f))
+        v_hat = v / (1.0 - tf.pow(beta2, t_f))
+        theta = theta - lr * m_hat / (tf.sqrt(v_hat) + eps)
+
+    return _joint_bij.forward(theta)
+
+def run_inference_pipeline_alt(test_indices, true_labels_norm, aspcap_errors,
+                               flux_array, ivar_array):
+    CHECKPOINT_ALT_PATH = os.path.join(RESULTS_DIR, "checkpoint_alt.npz")
+    RESULTS_ALT_PATH    = os.path.join(RESULTS_DIR, "results_alt.npz")
+    
+    def load_alt_checkpoint():
+        fresh = {
+            'global_indices': [], 'true_labels': [], 'inferred_labels': [],
+            'inferred_errors': [], 'aspcap_errors': [], 'wall_seconds': [],
+        }
+        if os.path.exists(CHECKPOINT_ALT_PATH):
+            data = np.load(CHECKPOINT_ALT_PATH, allow_pickle=True)
+            results = {k: list(data[k]) if k in data else [] for k in fresh}
+            n_done = len(results['global_indices'])
+            print(f"  Resuming (Joint MAP): {n_done} stars done.")
+            return results, n_done
+        return fresh, 0
+
+    n_stars = len(test_indices)
+    true_labels_physical = (
+        true_labels_norm[:, :N_LABELS_RAW] * STD_TENSOR[:N_LABELS_RAW]
+        + MEAN_TENSOR[:N_LABELS_RAW]
+    )
+    results, n_done = load_alt_checkpoint()
+    remaining = list(range(n_done, n_stars))
+
+    print(f"\n{'='*60}")
+    print(f"  Tier 1-Alt: JOINT MAP Optimization (XLA compiled)")
+    print(f"  To do: {len(remaining)} stars")
+    print(f"{'='*60}\n")
+
+    total_start = time.time()
+    for batch_start in range(0, len(remaining), BATCH_SIZE_STARS):
+        batch_local = remaining[batch_start:batch_start + BATCH_SIZE_STARS]
+        actual = len(batch_local)
+        b_flux = flux_array[batch_local].astype(np.float32)
+        b_ivar = ivar_array[batch_local].astype(np.float32)
+        cnn_mu, cnn_sig = cnn_predict_physical(b_flux)
+
+        if actual < BATCH_SIZE_STARS:
+            pad = BATCH_SIZE_STARS - actual
+            b_flux = np.concatenate([b_flux, np.zeros((pad, N_PIXELS), np.float32)])
+            b_ivar = np.concatenate([b_ivar, np.zeros((pad, N_PIXELS), np.float32)])
+            cnn_mu  = np.concatenate([cnn_mu, np.tile(cnn_mu[:1], (pad, 1))])
+            cnn_sig = np.concatenate([cnn_sig, np.tile(cnn_sig[:1], (pad, 1))])
+
+        obs_flux_tf = tf.constant(b_flux); obs_ivar_tf = tf.constant(b_ivar)
+        cnn_mu_tf = tf.constant(cnn_mu); cnn_sig_tf = tf.constant(cnn_sig)
+
+        t0 = time.time()
+        margin = 1e-3
+        joint_init_phys = tf.clip_by_value(cnn_mu_tf, bounds_low + margin, bounds_high - margin)
+        joint_init_unc = _joint_inv.forward(joint_init_phys)
+
+        joint_result = map_optimize_joint(joint_init_unc, obs_flux_tf, obs_ivar_tf, cnn_mu_tf, cnn_sig_tf)
+        
+        # Laplace
+        joint_f_unc = _joint_inv.forward(joint_result)
+        joint_errors = compute_uncertainties_joint(joint_f_unc, obs_flux_tf, obs_ivar_tf, cnn_mu_tf, cnn_sig_tf)
+        
+        joint_result_np = joint_result.numpy(); joint_errors_np = joint_errors.numpy()
+        elapsed = time.time() - t0
+        print(f"    Joint MAP + Laplace: {elapsed:.2f}s")
+
+        for b in range(actual):
+            local_idx = batch_local[b]
+            results['global_indices'].append(int(test_indices[local_idx]))
+            results['true_labels'].append(true_labels_physical[local_idx])
+            results['inferred_labels'].append(joint_result_np[b])
+            results['inferred_errors'].append(joint_errors_np[b])
+            results['aspcap_errors'].append(aspcap_errors[local_idx, :N_LABELS_RAW])
+            results['wall_seconds'].append(elapsed / actual)
+
+        n_done += actual
+        np.savez(CHECKPOINT_ALT_PATH, **{k: np.array(v) for k, v in results.items()})
+
+    total_elapsed = time.time() - total_start
+    print(f"\nAll {n_stars} stars done in {total_elapsed:.1f}s.")
+    
+    arrays = {k: np.array(v) for k, v in results.items()}
+    arrays['label_names'] = np.array(LABEL_NAMES)
+    np.savez(RESULTS_ALT_PATH, **arrays)
     return results
 
 # ================================================================
