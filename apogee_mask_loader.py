@@ -70,7 +70,7 @@ def insert_gaps(window_7514):
 
 
 # ── Main builder ─────────────────────────────────────────────────────────
-def build_apogee_mask(filt_dir='element filters', output_path='apogee_mask.npy'):
+def build_apogee_mask(filt_dir='element masks', output_path='apogee_inference_mask.npy'):
     """
     Build the apogee_mask array from .filt files and save it.
 
@@ -91,7 +91,7 @@ def build_apogee_mask(filt_dir='element filters', output_path='apogee_mask.npy')
     for label in ATOMIC_LABELS:
         col_idx = LABELS_ORDER.index(label)
         element = LABEL_TO_ELEMENT[label]
-        filt_path = os.path.join(filt_dir, f'{element}.filt')
+        filt_path = os.path.join(filt_dir, f'{element}.mask')
 
         print(f'Loading {filt_path} for {label} (column {col_idx}) ... ', end='')
 
@@ -110,6 +110,6 @@ def build_apogee_mask(filt_dir='element filters', output_path='apogee_mask.npy')
 
 if __name__ == '__main__':
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    filt_dir = os.path.join(script_dir, 'element filters')
-    out_path = os.path.join(script_dir, 'apogee_mask.npy')
+    filt_dir = os.path.join(script_dir, 'element masks')
+    out_path = os.path.join(script_dir, 'apogee_inference_mask.npy')
     build_apogee_mask(filt_dir=filt_dir, output_path=out_path)
