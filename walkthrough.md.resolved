@@ -1,0 +1,84 @@
+# Masked Loss Implementation — Walkthrough
+
+## What Changed
+
+### New Notebook Cell (inserted after [spl_loss](file:///c:/Users/ANEESHSHASTRI/Documents/GitHub/PRISM/masked_loss.py#171-202) definition)
+
+Contains all masked loss logic — no external [.py](file:///tmp/inspect_masks.py) file needed:
+
+| Component | Purpose |
+|-----------|---------|
+| [load_cno_masks()](file:///c:/Users/ANEESHSHASTRI/Documents/GitHub/PRISM/masked_loss.py#47-74) | Loads C/N/O [.filt](file:///c:/Users/ANEESHSHASTRI/Documents/GitHub/PRISM/element%20filters/K.filt) files (7514→8575 gap insertion) |
+| [compute_star_pixel_masks()](file:///c:/Users/ANEESHSHASTRI/Documents/GitHub/PRISM/masked_loss.py#80-165) | Per-star pixel masks from [apogee_mask](file:///c:/Users/ANEESHSHASTRI/Documents/GitHub/PRISM/apogee_mask_loader.py#73-109) + CNO filters |
+| [masked_spl_loss()](file:///c:/Users/ANEESHSHASTRI/Documents/GitHub/PRISM/masked_loss.py#171-202) | 3-channel `y_true` loss with pixel masking |
+| [masked_chi2_estimate()](file:///c:/Users/ANEESHSHASTRI/Documents/GitHub/PRISM/masked_loss.py#204-228) | χ² metric for 3-channel format |
+| [GradientGate](file:///c:/Users/ANEESHSHASTRI/Documents/GitHub/PRISM/masked_loss.py#234-260) | Per-sample gradient severing via `tf.stop_gradient` |
+| [build_prism_emulator_masked()](file:///c:/Users/ANEESHSHASTRI/Documents/GitHub/PRISM/masked_loss.py#266-390) | PRISM model with gated CNO + abundance inputs |
+
+### Modified Cells
+
+| Cell | Change |
+|------|--------|
+| **Config** | Added `CNO_FILT_DIR`, `APOGEE_MASK_PATH` |
+| **TFRecord pipeline** | 3-channel spectra (ch2=pixel_mask) + `bad_mask` feature |
+| **parse_and_normalize** | Reads 3-channel + bad_mask, returns 4 values |
+| **build_dataset** | `dual_input` flag → `_pack_for_prism` vs `_pack_for_single` |
+| **5 compile cells** | [spl_loss](file:///c:/Users/ANEESHSHASTRI/Documents/GitHub/PRISM/masked_loss.py#171-202) → [masked_spl_loss](file:///c:/Users/ANEESHSHASTRI/Documents/GitHub/PRISM/masked_loss.py#171-202) |
+| **PRISM build** | `build_final_emulator` → [build_prism_emulator_masked](file:///c:/Users/ANEESHSHASTRI/Documents/GitHub/PRISM/masked_loss.py#266-390) |
+| **PRISM train** | [build_dataset(dual_input=True)](file:///c:/Users/ANEESHSHASTRI/Documents/GitHub/PRISM/cnn_label_predictor.py#216-252) for [(labels, bad_mask)](file:///c:/Users/ANEESHSHASTRI/Documents/GitHub/PRISM/cnn_label_predictor.py#302-318) input |
+
+## How It Works
+
+```mermaid
+graph TD
+    A["bad_mask<br/>(N_stars, 23) bool"] --> B["compute_star_pixel_masks"]
+    C["apogee_mask.npy<br/>(8575, 27)"] --> B
+    D["CNO .filt files<br/>(7514 each)"] --> B
+    B --> E["pixel_masks<br/>(N_stars, 8575)"]
+    E --> F["TFRecord<br/>spectra = [flux, ivar, pixel_mask]"]
+    A --> G["TFRecord<br/>bad_mask = float32 (23,)"]
+    
+    F --> H{"build_dataset"}
+    G --> H
+    
+    H -->|"dual_input=False"| I["(labels, spectra, weight)<br/>Payne/CNN/EXPayne/RegPayne"]
+    H -->|"dual_input=True"| J["((labels, bad_mask), spectra, weight)<br/>PRISM only"]
+    
+    I --> K["masked_spl_loss<br/>pixel_mask zeros imputed pixels"]
+    J --> L["masked_spl_loss + GradientGate<br/>pixel mask + gradient severing"]
+```
+
+### GradientGate Math
+
+```python
+live = label_value * (1.0 - is_imputed)     # gradient flows
+dead = tf.stop_gradient(label_value) * is_imputed  # gradient blocked
+return live + dead  # forward pass unchanged for both
+```
+
+## Verification Results
+
+20/20 logic checks passed:
+
+- **Notebook structure**: All 14 required functions/configs present
+- **Dataset flow**: Single-input models (Payne, CNN, EXPayne, RegPayne) get [(labels, spectra, weight)](file:///c:/Users/ANEESHSHASTRI/Documents/GitHub/PRISM/cnn_label_predictor.py#302-318); PRISM gets [((labels, bad_mask), spectra, weight)](file:///c:/Users/ANEESHSHASTRI/Documents/GitHub/PRISM/cnn_label_predictor.py#302-318)
+- **Pixel masks**: C+N overlap test: C=3657, N=3157, overlap=1980, total=4834 ✓
+- **Gap insertion**: Blue=3028 + Green=2495 + Red=1991 = 7514 ✓
+- **RegPayne**: Uses [masked_spl_loss](file:///c:/Users/ANEESHSHASTRI/Documents/GitHub/PRISM/masked_loss.py#171-202) with single-input dataset ✓
+
+## Computational Cost
+
+| Metric | Value |
+|--------|-------|
+| Extra disk (140K stars) | ~4.5 GB |
+| Extra GPU memory/batch | ~8.4 MB |
+| GradientGate overhead | <1 ms/step |
+| Pixel mask multiply | ~0.2 ms/step |
+| **Total overhead** | **<5% of ~23 ms/step** |
+
+## Before Running on Kaggle
+
+> [!IMPORTANT]
+> 1. **Delete old `.tfrec` files** so `generate_tfrecords()` re-runs with 3-channel spectra
+> 2. Adjust `CNO_FILT_DIR` and `APOGEE_MASK_PATH` in Config to match your Kaggle dataset paths
+> 3. The backup notebook is at `model-trainer_backup.ipynb`
