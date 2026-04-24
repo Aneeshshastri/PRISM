@@ -1,0 +1,130 @@
+# PRISM Model Improvements: Warm-Restart, Wider Experts, Expanded EOS
+
+Three targeted changes to improve PRISM's tail performance (95th %ile gap) without modifying its core physics-enforcing architecture.
+
+> [!IMPORTANT]
+> Changes 3 and 4 modify the model architecture, so the model must be **retrained from scratch** — existing `SPECTROGRAM_GENERATOR.keras` weights will not be compatible. Change 2 (warm-restart) operates on whatever architecture is trained.
+
+## Proposed Changes
+
+### PRISM Model Builder
+
+#### [MODIFY] [model-trainer.ipynb](file:///c:/Users/ANEESHSHASTRI/Documents/GitHub/PRISM/model-trainer.ipynb)
+
+**Change 4 — Expand EOS State Vector (8 → 16)**
+
+In [build_prism_emulator_masked](file:///c:/Users/ANEESHSHASTRI/Documents/GitHub/PRISM/masked_loss.py#266-390) (Cell 1, ~line 348):
+```diff
+-    state_vector = layers.Dense(8, activation='linear', name="State_Vector")(x_state)
++    state_vector = layers.Dense(16, activation='linear', name="State_Vector")(x_state)
+```
+
+Same change in `build_final_emulator` (Cell 11, ~line 1564):
+```diff
+-    state_vector = layers.Dense(8, activation='linear', name="State_Vector")(x_state)
++    state_vector = layers.Dense(16, activation='linear', name="State_Vector")(x_state)
+```
+
+**Rationale**: The 8-d state vector is shared across all 14 atomic experts. Different elements respond differently to thermodynamic state (e.g., ionisation shifts with Teff differ for Ti I vs Fe I). Doubling to 16 gives each expert more context without adding much parameter cost.
+
+---
+
+**Change 3 — Widen Atomic Experts**
+
+In [build_prism_emulator_masked](file:///c:/Users/ANEESHSHASTRI/Documents/GitHub/PRISM/masked_loss.py#266-390) (Cell 1, ~lines 363–366):
+```diff
+         expert_in = layers.Concatenate()([state_vector, raw_abundance])
+-        x = layers.Dense(64, activation='swish')(expert_in)
+-        local_tau = layers.Dense(n_active, activation='softplus',
++        expert_width = max(64, min(256, n_active))
++        x = layers.Dense(expert_width, activation='swish')(expert_in)
++        x = layers.Dense(expert_width // 2, activation='swish')(x)
++        local_tau = layers.Dense(n_active, activation='softplus',
+                                  name=f"Tau_{label}_Local")(x)
+```
+
+Same change in `build_final_emulator` (Cell 11, ~lines 1576–1580).
+
+**What this does per element** (based on `apogee_mask.npy` active pixel counts):
+
+| Element | Active Pixels | Old Width | New Width (2 layers) |
+|---|---|---|---|
+| FE_H | 1933 | 64 | 256 → 128 |
+| NI_FE | 181 | 64 | 181 → 90 |
+| MG_FE | 105 | 64 | 105 → 52 |
+| SI_FE | 96 | 64 | 96 → 48 |
+| MN_FE | 63 | 64 | 64 → 32 |
+| AL_FE | 47 | 64 | 64 → 32 |
+| CR_FE | 42 | 64 | 64 → 32 |
+| TI_FE | 31 | 64 | 64 → 32 |
+| V_FE | 27 | 64 | 64 → 32 |
+| CO_FE | 23 | 64 | 64 → 32 |
+| CA_FE | 19 | 64 | 64 → 32 |
+| K_FE | 14 | 64 | 64 → 32 |
+| NA_FE | 13 | 64 | 64 → 32 |
+| S_FE | 8 | 64 | 64 → 32 |
+
+Elements with few active pixels keep the 64-unit floor. FE_H (the dominant element) scales to 256 → 128.
+
+---
+
+**Change 2 — Warm-Restart Fine-Tuning**
+
+Add a new cell after the PRISM training cell (after Cell 12, ~line 2777). This fine-tunes the already-trained model with a fresh Adam optimizer at 10× lower LR and aggressive early stopping:
+
+```python
+if config.TRAIN_MODEL['mine']:
+    print("\n--- WARM-RESTART FINE-TUNING (LR=1e-4) ---")
+    
+    base_model.compile(
+        optimizer=tf.keras.optimizers.Adam(1e-4, clipnorm=config.CLIP_NORM),
+        loss=masked_spl_loss
+    )
+    
+    finetune_callbacks = [
+        callbacks.ModelCheckpoint('SPECTROGRAM_GENERATOR.keras',
+                                  save_best_only=True, monitor='val_loss'),
+        callbacks.EarlyStopping(patience=10, restore_best_weights=True,
+                                monitor='val_loss', min_delta=1e-8),
+        callbacks.ReduceLROnPlateau(patience=3, factor=0.5,
+                                    min_lr=1e-6, verbose=1),
+    ]
+    
+    history_finetune = base_model.fit(
+        train_ds_prism,
+        validation_data=val_ds_prism,
+        epochs=50,
+        callbacks=finetune_callbacks,
+        verbose=1
+    )
+    
+    base_model.save('SPECTROGRAM_GENERATOR.keras')
+    np.save('history_finetune.npy', history_finetune.history)
+```
+
+**Key design decisions**:
+- Fresh Adam at 1e-4 resets momentum, allowing the optimizer to explore from the current weight basin
+- Tighter EarlyStopping (patience=10) and faster LR reduction (patience=3) since we're doing surgical refinement
+- `min_delta=1e-8` catches diminishing returns faster
+- Overwrites the same `.keras` file — the checkpoint ensures we keep the best
+
+---
+
+## Verification Plan
+
+### Automated Verification
+
+Write a Python script that:
+1. Loads the modified notebook as JSON
+2. Extracts [build_prism_emulator_masked](file:///c:/Users/ANEESHSHASTRI/Documents/GitHub/PRISM/masked_loss.py#266-390) and `build_final_emulator` source code
+3. Asserts `Dense(16` appears in the State_Vector line (Change 4)
+4. Asserts `max(64, min(256, n_active))` pattern exists (Change 3)
+5. Asserts a second `Dense(...swish)` layer exists in the expert loop (Change 3)
+6. Verifies a warm-restart cell exists with `Adam(1e-4` (Change 2)
+7. Verifies `build_final_emulator` has the same EOS and expert changes
+
+Run with: `C:/Users/ANEESHSHASTRI/miniconda3/python.exe /tmp/verify_prism_changes.py`
+
+### Manual Verification
+
+The user should run the notebook on Kaggle with `TRAIN_MODEL={'mine': True, ...}` and compare the new χ² results against the current baseline.
