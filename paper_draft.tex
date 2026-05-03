@@ -25,25 +25,33 @@ Unlike prior approaches that rely on synthetic spectral grids, we train our mode
 149,966 stars with signal-to-noise ratio $>100$ using stellar parameters and chemical
 abundances from the ASPCAP pipeline as labels, spanning a wavelength range of 1514--1694\,nm.
 
-The model predicts optical depth through four physically motivated branches---a continuum
-branch, a CNO molecular branch, a thermodynamic state branch, and a chemical expert branch
-with element-specific weighted spectral masks sourced from ASPCAP's \texttt{.filt}
-files---and converts to flux via the Beer-Lambert law. Physics-based disentanglement is
-enforced architecturally by restricting each element's spectral sensitivity to its
-permitted spectral windows. We evaluate model performance using a
-reduced $\chi^2$ statistic and compare against four baselines:
-The Payne, an Expanded Payne, a baseline Ablation Prism, and a regularized Payne (RegPayne).
+The current repository implements Prism as a two-input masked model: in addition to the
+27-dimensional label vector, the network receives a 23-dimensional per-label imputation
+mask and is trained against a 3-channel target tensor containing flux, inverse variance,
+and a per-star pixel mask. The architecture predicts optical depth through a continuum
+branch, a CNO molecular branch, a thermodynamic state branch, and element-specific sparse
+atomic experts, then converts to flux via the Beer-Lambert law. The active trainer also
+retains a single-input structured ablation used as the comparison model ``Ablation Prism,''
+which preserves the sparse atomic projection masks but feeds the full label vector through
+its internal branches.
 
-Prism achieves a median reduced $\chi^2_\mathrm{red} = 1.766$ on a held-out test set of
-$\sim$9,966 stars, outperforming all baselines. An information-leakage test confirms that
-Prism's gradient response at forbidden pixels is identically zero (as required by its
-architecture). Notably, Ablation Prism---which shares Prism's branched architecture but
-omits the spectral masks---achieves substantially lower leakage than flat-MLP baselines,
-demonstrating that the per-element branch structure itself promotes disentanglement
-independently of the hard masking constraint.
-The model generalizes and extrapolates well across most parameter ranges, though performance
-systematically degrades in cool regions (due to complicated molecular physics) and for hot
-stars which lie out of the training distribution.
+Evaluation in the current codebase is explicitly imputation-aware: stars with imputed core,
+CNO, or Fe labels are dropped, while trace-element imputations are handled by masking the
+corresponding spectral windows. On the retained 8,938-star subset of the held-out test set,
+Prism attains a median reduced $\chi^2_\mathrm{red}=1.718$, competitive with the
+pre-trained Payne-family baselines loaded by the evaluation notebook. Prism's defining
+advantage is structural rather than purely residual-based: an information-leakage test
+returns exactly zero forbidden-region response for all 14 atomic species, while every
+baseline exhibits non-zero cross-element leakage. We further validate a fast inverse
+pipeline built around a heteroscedastic CNN warm start and XLA-compiled MAP optimization;
+on a 500-star stratified sample it achieves median wall-time 0.31\,s per star with
+RMSEs of 218\,K in $T_\mathrm{eff}$, 0.107\,dex in $\log g$, and 0.039\,dex in
+$[\mathrm{M/H}]$, but much smaller MADs of 10.3\,K, 0.038\,dex, and 0.013\,dex,
+respectively, indicating that the inverse fit is usually tight and that the inflated RMSE
+is driven by a small number of severe outliers. The resulting repository now supports a
+more nuanced conclusion: hard spectral locality yields exact disentanglement and
+competitive forward fits, with especially strong behaviour in weak-line regimes such as
+metal-poor giants.
 \end{abstract}
 
 \keywords{stars: abundances --- stars: fundamental parameters --- methods: data analysis ---
@@ -203,6 +211,14 @@ decode stellar physics:
 We apply $z$-score normalization to all labels (raw and engineered) using training-set statistics.
 Spectral fluxes are used as delivered by ASPCAP (already pseudo-continuum normalized).
 
+The current training pipeline augments each star with two additional mask objects derived
+from the imputation flags. First, a 23-dimensional \texttt{bad\_mask} records which input
+labels were imputed. Second, a per-star 8575-pixel mask suppresses wavelengths associated
+with imputed C, N, O, or trace-element abundances using \texttt{apogee\_mask.npy} and the
+APOGEE \texttt{.filt} windows. These masks are serialized into the TFRecord files used by
+the active trainer, allowing both the loss and the architecture to treat imputed labels
+explicitly rather than relying on naive evaluation against filled-in targets.
+
 %------------------------------------------------------------
 \section{Model Architecture}
 \label{sec:model}
@@ -234,26 +250,33 @@ CNO group), and each term is produced by a dedicated network branch.
 \label{subsec:branches}
 
 \subsubsection{Continuum Branch}
-The continuum branch receives the global parameters:
-$T_{\text{eff}},[\mathrm{M/H}],\log{g},v_{\text{macro}},v_{\text{micro}},v\sin{i}$,
-plus all engineered features. Using these inputs, it generates a coarse 268-pixel continuum
-that we progressively upsample via alternating upsampling and Conv1D layers to the full
-8575-pixel grid. The final convolutional layer uses a kernel of width 51 pixels, ensuring
-the branch produces smoothly varying pseudo-continuum and is structurally incapable of
-fitting sharp spectral lines. This architectural constraint encodes the physical fact that
-true stellar continua vary smoothly on scales much larger than individual line widths
-(${\sim}0.01$\,nm at $R \approx 22{,}500$).
+The current trainer replaces the earlier upsampling CNN continuum with a rigid
+Chebyshev-basis projection. A small multilayer perceptron maps the selected atmospheric
+inputs to 20 polynomial coefficients, and a custom \texttt{ChebyshevContinuum} layer
+projects those coefficients directly onto the 8575-pixel wavelength grid. This produces a
+smooth pseudo-continuum by construction while sharply limiting the branch's ability to fit
+narrow atomic structure, which is delegated to the molecular and atomic opacity branches.
+Architecturally, this is a meaningful change from the older learned upsampling stack:
+the continuum is now constrained to live in a low-order polynomial basis, making it both
+more interpretable and less able to absorb narrow line-like residuals that should instead
+be explained by the opacity branches.
 
 \subsubsection{CNO (Molecular) Branch}
-The CNO branch receives $[\mathrm{C/H}]$, $[\mathrm{N/H}]$, $[\mathrm{O/H}]$,
-$T_\mathrm{eff}$, and $\log g$. Because molecular line lists (CO, CN, OH, etc.) are
-incomplete and thousands of transitions contribute at every wavelength, we intentionally leave
-this branch unconstrained by pixel masks. It uses stacked dense layers to predict
-$\tau_\mathrm{CNO}$ across the full wavelength array.
+The molecular branch remains dense and global. In the two-input Prism model it receives a
+concatenation of selected atmospheric, rotational, and CNO quantities, and the codebase
+supports optional per-sample \texttt{GradientGate} suppression of imputed C, N, and O
+inputs. Two dense layers of widths 256 and 1024 predict $\tau_\mathrm{CNO}$ on the full
+8575-pixel grid. As in earlier versions, we leave this branch unmasked because blended
+molecular opacity is intrinsically non-local in wavelength space. The purpose of
+\texttt{GradientGate} is not to alter the forward value of an imputed label, but to block
+back-propagated dependence on that label for the affected sample. In effect, the notebook
+lets the model consume the filled value for numerical continuity while preventing the CNO
+branch from learning spurious gradients from labels that were not actually measured.
 
 \subsubsection{Thermodynamic State Branch}
 The thermodynamic state branch distills all global and CNO parameters into a compact
-latent state vector of dimension 8. We pass this state vector to the chemical expert
+latent state vector. In the current implementation the state branch uses two hidden layers
+of widths 32 and 16 followed by a 16-dimensional linear state vector. We pass this state vector to the chemical expert
 branch rather than raw label values, preventing the chemical branch from using
 $[M/\mathrm{H}]$ as a proxy for individual elemental abundances. This architectural
 choice is our primary mechanism for enforcing physically correct label--flux correlations.
@@ -264,7 +287,13 @@ atomic line formation occurs.
 \subsubsection{Chemical Expert Branch}
 Each atomic species $X$ has its own dedicated expert block. The block concatenates the
 thermodynamic state vector with a single scalar $[X/\mathrm{H}]$ and passes the result
-through two dense layers (64 units each), followed by a sparse spectral window projection.
+through a width-adaptive expert network:
+\begin{equation}
+W_X = \max\!\bigl(64, \min(256, N^\mathrm{active}_X)\bigr),
+\end{equation}
+where $N^\mathrm{active}_X$ is the number of active pixels in that element's mask. The
+expert then applies two dense layers of widths $W_X$ and $W_X/2$ before the sparse spectral
+window projection.
 We define the spectral windows using ASPCAP's \texttt{.filt} files
 \citep{GarciaperezASPCAP2016,Abdurrouf2022},
 which provide continuous-valued significance weights for each pixel--species pair rather
@@ -283,18 +312,47 @@ This weighting constraint is mathematically hard: gradients cannot propagate thr
 zero-weight pixels, so the network is provably unable to attribute spectral signal at a
 non-permitted wavelength to species $X$.
 
+The repository currently keeps two forward architectures side by side. The full Prism
+model is a two-input masked network using the per-label \texttt{bad\_mask}, while the
+single-input structured ablation (\texttt{build\_final\_emulator}) uses the same sparse
+atomic projectors but feeds \emph{the full input vector} into the continuum branch, the
+molecular branch, the thermodynamic state branch, and the expert multilayer perceptrons.
+It therefore removes the selective routing and gradient-gating logic of Prism while
+retaining the final masked atomic projection. The evaluation notebook loads these as
+distinct checkpoints: \texttt{APOGEE\_SGEN.keras} for Prism and
+\texttt{SPECTROGRAM\_GENERATOR.keras} for Ablation Prism.
+
 \subsection{Training}
 \label{subsec:training}
 
 We train the model end-to-end using the Adam optimizer with gradient clipping
-($\|\nabla\|_{\max} = 1.0$) and an initial learning rate of $10^{-3}$. We partition the APOGEE
-dataset into training (120,000 stars), validation (20,000 stars), and test
-($\sim$9,966 stars) sets. We mask sensor-gap pixels (identified by zero flux or zero inverse
-variance) from the loss throughout training. The model trains with a batch size of 256 for
-up to 150 epochs. Three callbacks regulate convergence:
-\texttt{ReduceLROnPlateau} (patience 2, factor 0.5), \texttt{EarlyStopping} (patience
-10, monitoring validation loss), and \texttt{ModelCheckpoint} saving the best-performing
-weights. We train all baselines using identical callbacks for fair comparison.
+($\|\nabla\|_{\max} = 1.0$) and an initial learning rate of $10^{-3}$. In the current
+trainer this learning rate is wrapped in a cosine-decay-restarts schedule with
+\texttt{first\_decay\_steps}=5000, $t_\mathrm{mul}=2.0$, $m_\mathrm{mul}=0.85$, and
+$\alpha=10^{-6}$. We partition the APOGEE dataset into training (120,000 stars),
+validation (20,000 stars), and held-out evaluation stars starting at index 140,000. The
+active TFRecord pipeline stores spectra as 3-channel tensors
+$(F,\mathit{ivar},M_\mathrm{pix})$, where $M_\mathrm{pix}$ is the per-star pixel mask
+constructed from the imputation flags.
+
+The current training notebook runs for up to 150 epochs with batch size 256, using
+\texttt{ModelCheckpoint} and \texttt{EarlyStopping} (patience 20,
+\texttt{min\_delta}=10^{-7}). In its present executed path, the notebook instantiates
+\texttt{build\_final\_emulator}---the newer Ablation Prism baseline with masked atomic
+projection but full-input routing---rather than the two-input gated Prism model. The full
+Prism builder remains implemented in the same notebook and is the architecture loaded as
+\texttt{APOGEE\_SGEN.keras} by the evaluation code. The other comparison models used in the
+evaluation notebook---The Payne, Expanded Payne, Ablation Prism, and RegPayne---are
+presently treated as fixed pre-trained checkpoints produced earlier with the same masked
+spectral-pixel loss, rather than being retrained inside the active
+\texttt{model-trainer.ipynb}. Relative to earlier versions of the repository, this
+constitutes an optimizer upgrade: the active training path uses scheduled cosine restarts
+and explicit gradient clipping instead of the older plateau-driven learning-rate reduction
+workflow. At the same time, the full two-input Prism model has not undergone the same
+breadth of hyperparameter fine-tuning as some baselines. This is primarily a compute
+limitation, not a statement that Prism was already exhaustively optimized; the current
+reported Prism results should therefore be interpreted as the performance of a
+compute-constrained but fully functional architecture snapshot.
 
 %------------------------------------------------------------
 \section{Loss and Evaluation Metrics}
@@ -304,10 +362,13 @@ weights. We train all baselines using identical callbacks for fair comparison.
 \subsection{Training Loss: Spectral Pixel Loss}
 \label{subsec:spl_loss}
 
-We define the training objective as a weighted mean squared error computed per pixel:
+The active repository uses a masked spectral pixel loss. For each star we store the target
+tensor as $(F_{\mathrm{obs}}, \mathit{ivar}, M_\mathrm{pix})$, where $M_\mathrm{pix}$ is a
+binary or continuous keep-mask that suppresses wavelengths contaminated by imputed labels.
+The loss is
 \begin{equation}
-\mathcal{L}_\mathrm{spl} = \frac{1}{N_\mathrm{valid}} \sum_{i}
-  w_i \bigl(F_{\mathrm{pred},i} - F_{\mathrm{obs},i}\bigr)^2,
+\mathcal{L}_\mathrm{masked} = \sum_{i}
+  M_{\mathrm{pix},i}\,w_i \bigl(F_{\mathrm{pred},i} - F_{\mathrm{obs},i}\bigr)^2,
 \label{eq:spl_loss}
 \end{equation}
 where the per-pixel weight is
@@ -328,7 +389,7 @@ During training, a Keras metric computes a batch-level estimate of the reduced
 $\chi^2$:
 \begin{equation}
 \hat{\chi}^2_\mathrm{red} = \frac{1}{\nu} \sum_{i}
-  \mathit{ivar}_i \, \bigl(F_{\mathrm{pred},i} - F_{\mathrm{obs},i}\bigr)^2,
+  M_{\mathrm{pix},i}\,\mathit{ivar}_i \, \bigl(F_{\mathrm{pred},i} - F_{\mathrm{obs},i}\bigr)^2,
 \label{eq:chi2_batch}
 \end{equation}
 where $\nu$ is the number of valid pixels per star and we use raw
@@ -339,46 +400,56 @@ gradient updates.
 \subsection{Test-time Evaluation: Reduced $\chi^2$}
 \label{subsec:chi2_full}
 
-For final model evaluation on the held-out test set, we compute a per-star reduced
-$\chi^2$ using instrumental variance plus a systematic variance floor:
+The current evaluation notebook no longer reports a naive full-spectrum statistic on all
+held-out stars. Instead, it uses an imputation-aware masked reduced $\chi^2$ designed to
+avoid scoring models against pixels whose target labels were themselves imputed. This is
+necessary because naive evaluation strongly penalizes stars with filled-in abundances:
+in the current notebook, the median $\chi^2$ ratio between imputed and non-imputed stars
+reaches 16.5 for C, 18.6 for O, 19.4 for Fe, and nearly 20 for Mg and Si.
+
+We therefore define the per-star metric as
 \begin{equation}
 \chi^2_{\mathrm{red},\star} = \frac{1}{\nu_\star} \sum_{i=1}^{N_\mathrm{pix}}
+  M_{\star i}\,
   \frac{\bigl(F_{\mathrm{pred},i} - F_{\mathrm{obs},i}\bigr)^2}
-       {\sigma^2_{\mathrm{instr},i}  + \sigma^2_\mathrm{floor}},
+       {\sigma^2_{\mathrm{instr},i}  + 10^{-5}},
 \label{eq:chi2_full}
 \end{equation}
-where $\sigma^2_\mathrm{instr} = 1/\mathit{ivar}$ is the instrumental variance and
-$\sigma^2_\mathrm{floor} = 10^{-5}$ accounts for systematic uncertainties not captured
-by ASPCAP's reported $\mathit{ivar}$, including continuum normalization artifacts and
-residual telluric contamination at incorrectly flagged pixels. This value is conservative
-relative to the ${\sim}0.5$--1\% fractional flux calibration uncertainty reported for the
-APOGEE instrument \citep{GarciaperezASPCAP2016,Abdurrouf2022}, which would correspond to
-$\sigma^2_\mathrm{floor} \sim 2.5\times10^{-5}$--$10^{-4}$ in normalized flux units.
-The degrees of freedom $\nu_\star$ equal the number of valid pixels minus the number of
-input labels. This formulation is identical for all models, ensuring a fair cross-model
-comparison independent of architectural differences.
+where $\sigma^2_{\mathrm{instr},i}=1/\mathit{ivar}_i$ and $M_{\star i}$ is a per-star
+evaluation mask. Stars with any imputed core, CNO, or $[\mathrm{Fe/H}]$ labels are removed
+entirely; for retained stars, if a trace abundance was imputed, then only that element's
+sensitive windows are masked out using the APOGEE spectral masks. The degrees of freedom
+$\nu_\star$ equal the number of retained pixels after masking. This protocol preserves a
+fair comparison across models while preventing imputed labels from dominating the reported
+forward-fit statistic.
 
 %------------------------------------------------------------
 \section{Validation}
 \label{sec:validation}
 %------------------------------------------------------------
 
-We evaluate Prism on a held-out test set of $\sim$9,966 stars
-(indices 140,000--149,966) against four baselines trained on the same data split:
-The Payne, an Expanded Payne (larger hidden layers), Ablation Prism (the same architecture
-without weighted filters), and RegPayne (a regularized, physics-guided
-variant trained with a two-phase Jacobian penalty schedule).
+We evaluate Prism on the held-out DR17 test block beginning at index 140,000. The raw
+split contains 9,966 stars, but the active masked protocol drops 1,028 stars with imputed
+core, CNO, or iron labels, leaving 8,938 stars for the main forward-model comparison.
+We compare Prism against four pre-trained baselines that are still part of the repository:
+The Payne, Expanded Payne, Ablation Prism, and RegPayne. These baselines were not removed
+from the project; rather, they were already trained to completion with the masked spectral
+pixel loss and are now loaded as fixed checkpoints by the evaluation notebook.
 
 \subsection{Reduced $\chi^2$ Analysis}
 \label{subsec:chi2_results}
 
-Table~\ref{tab:chi2} reports the test-set reduced $\chi^2$ for each model computed
-via Equation~(\ref{eq:chi2_full}). Prism achieves the lowest median
-$\chi^2_\mathrm{red} = 1.766$, a 39\% improvement over The Payne (2.905) and a 17\%
-improvement over the next best unconstrained baseline, Expanded Payne (2.136).
+Table~\ref{tab:chi2} reports the masked test-set statistic defined in
+Equation~(\ref{eq:chi2_full}). Under this stricter protocol, all five models cluster
+fairly closely in residual quality. Prism remains competitive with a median
+$\chi^2_\mathrm{red}=1.718$, but it is no longer the lowest-residual model in the current
+repository snapshot: The Payne and RegPayne achieve slightly lower medians of 1.683 and
+1.687, respectively. The important updated interpretation is therefore a trade-off:
+Prism delivers exact spectral locality and zero leakage, while several baselines achieve
+slightly smaller masked residuals.
 
 \begin{deluxetable}{lrrr}
-\tablecaption{Reduced $\chi^2$ on the held-out test set \label{tab:chi2}}
+\tablecaption{Masked reduced $\chi^2$ on the retained held-out test stars \label{tab:chi2}}
 \tablewidth{0pt}
 \tablehead{
   \colhead{Model} &
@@ -387,22 +458,30 @@ improvement over the next best unconstrained baseline, Expanded Payne (2.136).
   \colhead{95th \%}
 }
 \startdata
-Prism          & 1.766 & 2.049 & 3.740 \\
-Ablation Prism & 1.932 & 2.225 & 3.903 \\
-RegPayne       & 1.994 & 2.403 & 4.516 \\
-Expanded Payne & 2.136 & 2.632 & 5.082 \\
-The Payne      & 2.905 & 3.901 & 8.629
+The Payne      & 1.683 & 1.890 & 3.348 \\
+RegPayne       & 1.687 & 1.893 & 3.332 \\
+Ablation Prism & 1.703 & 1.919 & 3.405 \\
+Prism          & 1.718 & 1.941 & 3.482 \\
+Expanded Payne & 1.820 & 2.114 & 3.759
 \enddata
 
-\tablecomments{All models are evaluated on the same $\sim$9,966-star test set with
-identical error propagation methodology. Test set comprises stars at indices
-140,000--149,966 of the APOGEE DR17 catalogue.}
+\tablecomments{All models are evaluated with the same imputation-aware masking protocol on
+the retained 8,938-star subset of the held-out test block. The dropped 1,028 stars have
+imputed core, CNO, or iron labels; retained stars with imputed trace abundances are scored
+only on unmasked windows.}
 \end{deluxetable}
 
 We further examine $\chi^2_\mathrm{red}$ as a function of $T_\mathrm{eff}$,
 $\log g$, $[M/\mathrm{H}]$, and SNR by computing binned medians across all five models
-(Figures~\ref{fig:chi2_vs_teff}--\ref{fig:chi2_vs_snr}). Prism maintains
-$\chi^2_\mathrm{red}$ closest to unity across all parameter ranges.
+(Figures~\ref{fig:chi2_vs_teff}--\ref{fig:chi2_vs_snr}). The main qualitative trends are
+shared across architectures: performance is strongest in the well-populated giant regime,
+remains competitive through most of the metallicity range, and degrades sharply for hot
+stars that lie well outside the dominant training distribution. Equally notable, however,
+is that the binned $\chi^2$ curves in the \texttt{results/} directory have nearly the same
+shape for all five models and differ mainly by modest vertical offsets. This suggests that
+the models are all encountering the same underlying difficulty structure in APOGEE
+spectra, and that the remaining performance gap may be governed more by the survey's
+intrinsic information and noise floor than by large untapped architectural gains.
 
 \subsection{$\chi^2$ by Stellar Type}
 \label{subsec:chi2_stellar}
@@ -424,12 +503,12 @@ Figure~\ref{fig:chi2_distributions}).
   \colhead{RegP}
 }
 \startdata
-RGB Tip          & 907  & 2.923 & 4.173 & 3.237 & 3.090 & 3.086 \\
-RGB Giants       & 6485 & 1.705 & 2.707 & 2.006 & 1.872 & 1.882 \\
-Subgiants        & 654  & 1.703 & 2.522 & 2.185 & 1.790 & 1.905 \\
-Dwarfs           & 338  & 1.756 & 2.522 & 2.267 & 1.855 & 1.963 \\
-Metal-poor Giants& 272  & 1.914 & 6.224 & 4.332 & 2.177 & 3.225 \\
-Hot Stars        & 66   & 1.920 & 4.133 & 2.896 & 2.406 & 2.325 \\
+RGB Tip          & 907  & 2.714 & 2.593 & 2.982 & 2.659 & 2.610 \\
+RGB Giants       & 6485 & 1.662 & 1.627 & 1.744 & 1.646 & 1.632 \\
+Subgiants        & 654  & 1.945 & 1.784 & 1.997 & 2.158 & 1.853 \\
+Dwarfs           & 338  & 1.996 & 1.858 & 2.174 & 2.255 & 1.902 \\
+Metal-poor Giants& 272  & 1.962 & 2.003 & 2.228 & 1.980 & 2.060 \\
+Hot Stars        & 66   & 11.647 & 8.877 & 5.639 & 16.894 & 7.100 \\
 \enddata
 \tablecomments{Group definitions --- RGB Tip: $T_\mathrm{eff}<4000$\,K, $\log g<1.5$;
 RGB Giants: $4000<T_\mathrm{eff}<5000$\,K, $1.5<\log g<3.5$;
@@ -437,20 +516,20 @@ Subgiants: $4500<T_\mathrm{eff}<6500$\,K, $3.5<\log g<4.2$;
 Dwarfs: $\log g>4.2$; Metal-poor Giants: $[\mathrm{Fe/H}]<-1$, $\log g<3.5$;
 Hot Stars: $T_\mathrm{eff}>6500$\,K.
 Exp.P = Expanded Payne; AbP = Ablation Prism; RegP = RegPayne.
-Prism achieves the lowest median in all six categories. The metal-poor giant
-regime shows the largest separation between models.}
+Prism no longer leads every regime. Its clearest forward-fit advantage in the current
+evaluation appears for metal-poor giants, while RGB giants favor Payne-family baselines
+slightly and hot stars are difficult for all models.}
 \end{deluxetable}
 
 \begin{figure}
 \includegraphics[width=\textwidth]{Figures/chi2_distribution_by_type.png}
-\caption{Distributions of reduced $\chi^2_\mathrm{red}$ by stellar type, showing Prism
-(filled blue histogram) against all baselines (dashed vertical lines). The distributions
-reveal tail behaviour that medians alone do not capture: RGB Giants ($N=6485$) show a
-tight Prism distribution peaking near 1.7 against a broad, heavy-tailed Payne
-distribution; metal-poor giants ($N=272$) show the largest inter-model separation with
-Prism's distribution largely below 2.5 while The Payne extends past 10; hot stars
-($N=66$) show elevated $\chi^2_\mathrm{red}$ across all models, consistent with this
-population lying outside the training distribution.
+\caption{Distributions of masked reduced $\chi^2_\mathrm{red}$ by stellar type, showing
+Prism (filled blue histogram) against the baseline medians (dashed vertical lines). The
+main updated pattern is heterogeneous rather than uniform dominance: Prism is especially
+competitive in metal-poor giants, remains close to the best model in the RGB giant regime,
+and deteriorates strongly for hot stars, where all methods enter a low-information
+near-infrared regime with weak metal features, dissociated molecules, and often stronger
+rotational broadening.
 \label{fig:chi2_distributions}}
 \end{figure}
 
@@ -476,24 +555,17 @@ zero-weight pixels by construction, so the zero-leakage result verifies that the
 architectural constraint operates as intended rather than providing independent evidence of
 physics learning.
 
-The more informative result is that Ablation Prism---which shares Prism's per-element
-branch structure but omits the spectral masks---achieves leakage ratios of ${\sim}$0.18--0.73
-across most elements, substantially below the ${\sim}$0.61--1.08 range of flat-MLP baselines
-(The Payne and Expanded Payne) and the ${\sim}$0.41--1.06 range of RegPayne. This
-demonstrates that the per-element branched architecture itself promotes spectral
-disentanglement without explicit masking: the data-driven structure of the model recovers
-approximate spectral selectivity from the training signal alone, consistent with the atomic
-physics encoded in real APOGEE spectra.
-
-The notable exception is Potassium (K), for which Ablation Prism exhibits a leakage ratio
-of 4.61---the model places more gradient power at forbidden pixels than at K's own
-transitions. This is consistent with K having only two weak lines in the APOGEE bandpass,
-making its signal difficult to disentangle from correlated Fe-peak abundances without
-architectural enforcement.
-
-All unconstrained flat-MLP baselines (The Payne, Expanded Payne, RegPayne) exhibit leakage
-ratios near or above unity for the strongest absorbers (Fe, Mg), confirming that these
-models learn unphysical cross-element correlations that Prism's architecture eliminates.
+The repository's current leakage outputs show a starker split between hard and soft
+constraints than earlier drafts suggested. Ablation Prism does not consistently recover
+near-local behavior: several elements exceed unity, including Fe, Si, Al, Ni, Cr, V, and
+Co, with V reaching 2.44. The Payne-family baselines also retain broad non-zero leakage,
+typically at the 0.1--1.2 level depending on species. The robust statement supported by
+the present notebook is therefore narrower but clearer: exact locality requires more than a
+masked final projector. Ablation Prism still leaks because the full label vector is fed
+through shared global branches, allowing abundance information to influence flux outside the
+atomic expert pathways. In the current repository, only the full two-input Prism routing
+scheme---sparse atomic projection plus restricted/gated label flow---guarantees exact
+locality across all 14 atomic species.
 
 \begin{deluxetable}{lrrrrr}
 \tablecaption{Information-leakage ratios ($\bar{|\nabla|}_\mathrm{forb.}/\bar{|\nabla|}_\mathrm{allow.}$) for all 14 atomic species \label{tab:leakage}}
@@ -507,27 +579,26 @@ models learn unphysical cross-element correlations that Prism's architecture eli
   \colhead{Payne}
 }
 \startdata
-Fe  & 0.000 & 0.399 & 1.058 & 1.063 & 1.029 \\
-Mg  & 0.000 & 0.239 & 1.039 & 0.830 & 1.077 \\
-Si  & 0.000 & 0.387 & 0.736 & 0.772 & 0.881 \\
-Ca  & 0.000 & 0.176 & 0.407 & 0.469 & 0.606 \\
-Ti  & 0.000 & 0.233 & 0.470 & 0.565 & 0.606 \\
-S   & 0.000 & 0.055 & 0.778 & 0.753 & 0.939 \\
-Al  & 0.000 & 0.187 & 0.581 & 0.674 & 0.700 \\
-Mn  & 0.000 & 0.385 & 0.607 & 0.699 & 0.746 \\
-Ni  & 0.000 & 0.734 & 0.800 & 0.851 & 0.914 \\
-Cr  & 0.000 & 0.810 & 0.809 & 0.827 & 0.828 \\
-K   & 0.000 & \textbf{4.608} & 0.323 & 0.367 & 0.450 \\
-Na  & 0.000 & 0.157 & 0.376 & 0.448 & 0.531 \\
-V   & 0.000 & 0.255 & 0.900 & 0.929 & 0.912 \\
-Co  & 0.000 & 0.325 & 0.706 & 0.782 & 0.778 \\
+Fe  & 0.000 & \textbf{1.474} & \textbf{1.051} & 0.665 & \textbf{1.061} \\
+Mg  & 0.000 & 0.426 & 0.458 & 0.275 & 0.540 \\
+Si  & 0.000 & \textbf{1.219} & 0.632 & 0.933 & 0.621 \\
+Ca  & 0.000 & 0.377 & 0.229 & \textbf{1.187} & 0.237 \\
+Ti  & 0.000 & 0.515 & 0.200 & 0.530 & 0.203 \\
+S   & 0.000 & 0.366 & 0.374 & \textbf{1.083} & 0.462 \\
+Al  & 0.000 & \textbf{1.019} & 0.418 & 0.884 & 0.532 \\
+Mn  & 0.000 & 0.653 & 0.289 & 0.643 & 0.304 \\
+Ni  & 0.000 & \textbf{1.180} & 0.602 & 0.996 & 0.569 \\
+Cr  & 0.000 & \textbf{1.181} & 0.571 & 0.960 & 0.595 \\
+K   & 0.000 & 0.285 & 0.122 & 0.797 & 0.134 \\
+Na  & 0.000 & 0.385 & 0.181 & 0.834 & 0.197 \\
+V   & 0.000 & \textbf{2.444} & 0.630 & 0.865 & 0.636 \\
+Co  & 0.000 & \textbf{1.110} & 0.555 & \textbf{1.167} & 0.571 \\
 \enddata
 \tablecomments{AbP = Ablation Prism; RegP = RegPayne; Exp.P = Expanded Payne.
 Values $> 1$ (bold) indicate more gradient power at forbidden pixels than at the
 element's own transitions, a signature of abundance entanglement. Prism's zero leakage
-is guaranteed by its hard masking architecture. The anomalous K ratio in Ablation Prism
-(4.608) reflects K having only two weak H-band transitions, making its signal easily
-dominated by correlated Fe-peak features without architectural enforcement.}
+is guaranteed by its hard masking architecture; every comparison model retains non-zero
+cross-window sensitivity in the current notebook outputs.}
 \end{deluxetable}
 
 \subsection{Dependence on Stellar Parameters}
@@ -537,25 +608,29 @@ We examine model performance as a function of each key stellar parameter across 
 test set.
 
 \begin{figure}
-\includegraphics[width=0.49\textwidth]{Figures/median_chi2_vs_Teff.png}
-\includegraphics[width=0.49\textwidth]{Figures/median_chi2_vs_log_g.png}
-\caption{Left: Median reduced $\chi^2_\mathrm{red}$ versus effective temperature. All
-models degrade sharply below 4500\,K where molecular features dominate; Prism and Ablation
-Prism show similar behavior above this threshold. Right: Median $\chi^2_\mathrm{red}$
-versus surface gravity. Performance peaks at intermediate gravities
-($2 < \log g < 3.5$) where atomic lines are clearly resolved. Scatter at $\log g < 1$
-reflects the small AGB star sample.
+\includegraphics[width=0.49\textwidth]{Figures/median_chi2_vs_Teff_masked.png}
+\includegraphics[width=0.49\textwidth]{Figures/median_chi2_vs_log_g_masked.png}
+\caption{Left: Median masked reduced $\chi^2_\mathrm{red}$ versus effective temperature.
+All models degrade outside the dense training manifold, especially toward hot stars and
+the coolest molecularly complex giants. Right: Median masked $\chi^2_\mathrm{red}$
+versus surface gravity. The main giant branch remains the easiest regime, while sparse
+extremes in $\log g$ show larger model-to-model scatter. The qualitative similarity of the
+curves across architectures suggests a common APOGEE-driven difficulty profile rather than
+fundamentally different failure modes for each model.
 \label{fig:chi2_vs_teff}\label{fig:chi2_vs_logg}}
 \end{figure}
 
 \begin{figure}
-\includegraphics[width=0.49\textwidth]{Figures/median_chi2_vs_M_H.png}
-\includegraphics[width=0.49\textwidth]{Figures/median_chi2_vs_SNR.png}
-\caption{Left: Median $\chi^2_\mathrm{red}$ versus metallicity. Prism maintains
-competitive performance from $[M/\mathrm{H}]=-1.5$ to solar; all models degrade above
-solar where the training sample is sparse (${\sim}8\%$ of dataset). Right: Median
-$\chi^2_\mathrm{red}$ versus SNR. At SNR $>500$ Prism approaches $\chi^2_\mathrm{red}
-\approx 1.0$; the separation from baselines persists at all SNR values.
+\includegraphics[width=0.49\textwidth]{Figures/median_chi2_vs_M_H_masked.png}
+\includegraphics[width=0.49\textwidth]{Figures/median_chi2_vs_SNR_masked.png}
+\caption{Left: Median masked $\chi^2_\mathrm{red}$ versus metallicity. Prism is most
+competitive in the metal-poor giant regime, while the model ranking is otherwise fairly
+tight through the bulk of the metallicity distribution. Right: Median masked
+$\chi^2_\mathrm{red}$ versus SNR. Increasing SNR improves all models, but does not remove
+the structural trade-off between slightly lower residuals in some baselines and exact
+locality in Prism. The near-parallel profile shapes across models are consistent with all
+architectures approaching the practical information limit of APOGEE-quality spectra in this
+label space.
 \label{fig:chi2_vs_mh}\label{fig:chi2_vs_snr}}
 \end{figure}
 
@@ -589,11 +664,12 @@ but it encodes all the approximations of the theoretical atmosphere grid. By con
 our model is trained on real APOGEE spectra and therefore learns the empirical noise floor
 and calibration characteristics of the instrument.
 
-We trained a Payne-architecture baseline on the same APOGEE data and data split as Prism.
-On the held-out test set, the Payne baseline achieves a median $\chi^2_\mathrm{red}
-= 2.905$, compared with Prism's $1.766$---a 39\% improvement. The Payne baseline also
-suffers from leakage ratios near unity for all atomic species, confirming that it does not
-disentangle abundance labels from each other.
+The repository includes a Payne-architecture baseline evaluated on the same held-out DR17
+split as Prism. In the current imputation-aware protocol, Payne attains a median masked
+$\chi^2_\mathrm{red}=1.683$, slightly below Prism's 1.718. This means the present
+comparison is not a simple win on residuals alone. Instead, Prism's distinguishing
+contribution relative to Payne is structural: it achieves exact zero leakage, whereas
+Payne retains non-zero forbidden-window sensitivity for every atomic species tested.
 
 \subsection{TransformerPayne}
 \label{subsec:transformerpayne}
@@ -609,33 +685,39 @@ computational cost and with physically enforced interpretability.
 \subsection{Baseline Comparison: Expanded Payne, Ablation Prism, and RegPayne}
 \label{subsec:baselines}
 
-In addition to the original Payne architecture, which was intentionally left without hyperparameter fine-tuning to serve as a structurally identical baseline, we trained three further models on the same data split. Both the Expanded Payne and RegPayne were systematically fine-tuned using Optuna to maximize their baseline performance:
+In addition to the original Payne architecture, the repository keeps three further
+comparison models trained on the same split. These baselines remain part of the project,
+but the active trainer notebook no longer re-runs them because their masked-loss training
+has already been completed and the evaluator now loads the saved checkpoints directly.
+This comparison should also be read with one practical caveat: Prism was not subjected to
+an equally broad hyperparameter search, largely because available compute was concentrated
+on stabilizing the masked architecture itself rather than running extensive sweeps.
+Accordingly, the baseline comparison is informative about the current repository state, but
+it should not be over-interpreted as the final performance ceiling of the Prism design:
 \begin{enumerate}
 \item \textbf{Expanded Payne} --- a wider multi-layer perceptron with larger hidden layers,
-      increasing parameter capacity without adding physics constraints, fine-tuned via Optuna;
-\item \textbf{Ablation Prism} --- identical Prism architecture but without the spectral
-      masks, isolating the contribution of the per-element branch structure from the
-      hard masking constraint;
-\item \textbf{RegPayne} --- a Payne-like model fine-tuned via Optuna and trained with a two-phase Jacobian penalty
+      increasing parameter capacity without adding physics constraints;
+\item \textbf{Ablation Prism} --- a single-input Prism variant that retains the sparse
+      atomic projection masks but feeds the full label vector into the continuum,
+      molecular, state, and expert networks, isolating the effect of Prism's selective
+      routing and gradient-gating logic rather than removing masking entirely;
+\item \textbf{RegPayne} --- a Payne-like model trained with a two-phase Jacobian penalty
       schedule (phase 1: 5 epochs, $\lambda_J = 0$; phase 2: full training,
       $\lambda_J = 400$) using the \texttt{build\_disentangled\_model} framework.
 \end{enumerate}
 
 Results are summarized in Tables~\ref{tab:chi2} and \ref{tab:chi2_stellar}. Several
-observations are noteworthy. First, Ablation Prism (median $\chi^2_\mathrm{red} = 1.932$)
-outperforms both Expanded Payne (2.136) and RegPayne (1.994), despite having no
-architectural disentanglement constraint beyond the per-element branch structure. This
-suggests that architectural separation of element-specific optical depth contributions
-provides a useful inductive bias even without explicit masking. Second, Prism's
-further improvement over Ablation Prism (1.766 vs.\ 1.932) demonstrates the additional
-value of the hard masking constraint. Third, RegPayne's Jacobian penalty---a soft
-regularization approach---fails to improve upon Ablation Prism's spectral fit quality
-despite its explicit disentanglement objective, and its leakage ratios remain near unity
-(Section~\ref{subsec:leakage}), confirming that soft penalties are insufficient to enforce
-true disentanglement. Fourth, the metal-poor giant population reveals the largest
-performance gap: Prism achieves a median of 1.914 versus 6.224 for The Payne and 3.225
-for RegPayne, suggesting that physics constraints are most beneficial where abundance
-information is concentrated in a small number of weak, specific transitions.
+observations are noteworthy. First, the masked residual ranking is now tight:
+Payne (1.683), RegPayne (1.687), Ablation Prism (1.703), and Prism (1.718) all sit within
+0.035 in median $\chi^2_\mathrm{red}$, while Expanded Payne trails slightly at 1.820.
+Second, these small residual differences should be interpreted alongside the leakage test:
+Prism is the only model with exactly zero forbidden-window response for every element.
+Third, Ablation Prism no longer supports a strong claim that branch structure alone
+recovers near-perfect disentanglement; its current leakage ratios exceed unity for several
+species, showing that retaining masked atomic windows is not sufficient when the full label
+vector is broadcast through shared branches. Fourth, the metal-poor giant population
+remains the clearest niche where Prism's hard locality appears beneficial, with the best
+median $\chi^2_\mathrm{red}$ in that regime among the models tested.
 
 \subsection{Summary of Comparison}
 
@@ -657,17 +739,17 @@ The Cannon 2     & Real (DR12)  & Soft ($\ell_1$)  & Yes & ---   \\
 The Payne        & Synth.\ grid & None             & No  & ---   \\
 TransformerPayne & Synth.\ grid & None             & No  & ---   \\
 \hline
-Payne (ours)     & Real (DR17)  & None             & No  & 2.905 \\
-Expanded Payne   & Real (DR17)  & None             & No  & 2.136 \\
-Ablation Prism   & Real (DR17)  & Partial (branch) & No  & 1.932 \\
-RegPayne         & Real (DR17)  & Soft (Jacobian)  & Partial & 1.994 \\
-\textbf{Prism}   & Real (DR17)  & Hard (mask)      & Yes & \textbf{1.766}
+Payne (ours)     & Real (DR17)  & None             & No  & \textbf{1.683} \\
+Expanded Payne   & Real (DR17)  & None             & No  & 1.820 \\
+Ablation Prism   & Real (DR17)  & Masked output only & Partial & 1.703 \\
+RegPayne         & Real (DR17)  & Soft (Jacobian)  & Partial & 1.687 \\
+\textbf{Prism}   & Real (DR17)  & Hard (mask + routing) & Yes & 1.718
 \enddata
 \tablecomments{Top section: published models (qualitative comparison only; dashes indicate
 no reported $\chi^2_\mathrm{red}$ on real APOGEE data). Bottom section: baselines trained
-on the same DR17 data split. Ablation Prism's ``Partial (branch)'' reflects its per-element
-architecture substantially reducing leakage versus flat-MLP baselines without guaranteeing
-zero leakage (Section~\ref{subsec:leakage}).}
+on the same DR17 data split and evaluated with the masked held-out protocol. The best
+current median $\chi^2_\mathrm{red}$ belongs to Payne, but Prism is uniquely
+distinguished by exact zero leakage across all 14 atomic species.}
 \end{deluxetable}
 
 %------------------------------------------------------------
@@ -675,25 +757,55 @@ zero leakage (Section~\ref{subsec:leakage}).}
 \label{sec:backward_inference}
 %------------------------------------------------------------
 
-With Prism robustly transferring empirical patterns into its forward mapping, it naturally supports \emph{backward inference}---recovering stellar traits from newly observed spectra without training an explicit label regressor. We embed the trained Prism emulator within an optimization loop and utilize Maximum a Posteriori (MAP) estimation to invert the spectrum-to-label process.
+With Prism robustly transferring empirical patterns into its forward mapping, it naturally
+supports \emph{backward inference}---recovering stellar traits from newly observed spectra
+without training a separate end-to-end regressor. The maintained inverse notebook performs
+fast Maximum a Posteriori (MAP) recovery by embedding the trained forward emulator inside a
+two-stage optimization loop.
 
-\subsection{Optimization Setup and Uncertainty Estimation}
+\subsection{Optimization Setup and Diagnostics}
 \label{subsec:map_setup}
-To map an observed flux $F_\mathrm{obs}$ back to underlying labels $\theta$, we minimize a joint likelihood loss combining the reconstruction fidelity (spectral pixel loss) and a parameter prior derived from a data-driven warm-start initial guess:
+The current inverse pipeline begins with a heteroscedastic CNN warm start trained in
+\texttt{CNNwarmstart.ipynb}. That network processes the observed spectrum with four 1D
+convolutional blocks (32, 64, 128, and 256 channels) followed by dense layers of widths
+512 and 256, and predicts both a mean label vector and a per-label variance through a
+Gaussian negative log-likelihood objective. Its output supplies the initialization and
+diagonal Gaussian prior for the subsequent MAP optimization.
+
+To map an observed flux $F_\mathrm{obs}$ back to underlying labels $\theta$, we minimize a
+joint objective combining the spectral reconstruction term and the warm-start prior:
 \begin{equation}
 \mathcal{L}_\mathrm{MAP}(\theta) = \frac{1}{2}\sum_i \mathit{ivar}_i \bigl(F_{\mathrm{obs},i} - F_{\mathrm{pred},i}(\theta)\bigr)^2 + \frac{1}{2} w_\mathrm{prior} \sum_j \left(\frac{\theta_j - \mu_j}{\sigma_j}\right)^2,
 \end{equation}
-where $\mu_j$ and $\sigma_j$ are priors initialized by predicting labels using a lightweight warm-start Heteroscedastic Convolutional Neural Network (CNN) estimator, anchoring inferences to a physically sound neighborhood. Prism is exceptionally efficient for this gradient-based routine due to its analytic derivatives. Using XLA-accelerated Adam optimizer instances partitioned logically into Core and Element stages, we obtain a converged MAP estimate $\hat{\theta}$.
+where $\mu_j$ and $\sigma_j$ are the CNN-predicted means and standard deviations. The
+optimization itself is FERRE-like and staged. First, a 9-dimensional core problem is fit
+on the full spectrum using 1200 Adam steps. Second, the 14 trace abundances are refined in
+independent one-dimensional optimizations over their masked spectral windows, using 400 Adam
+steps per element. The notebook runs this procedure in batches of 32 with XLA compilation.
 
-To provide robust, physically grounded confidence bounds alongside our point approximations, we bypass unstable internal curvature derivations and formally adopt the historically robust test-time uncertainties ($\sigma_\mathrm{ASPCAP}$) supplied by the established APOGEE data pipeline.
+The current maintained notebook focuses on fast point estimation rather than calibrated
+posterior uncertainty. Earlier text describing ASPCAP uncertainties as adopted confidence
+bounds is therefore no longer representative of the repository; uncertainty-aware inverse
+methods are being explored separately in prototype Laplace, HMC, and NUTS workflows, but
+they are not the mainline result reported here.
 
 \subsection{Validation on Stratified Test Sample}
 \label{subsec:map_results}
-We validated the backward optimization routine extracting the 23 labels on a thoroughly stratified test sample of $N=500$ stars purposefully binned uniformly across $T_\mathrm{eff}$, $\log{g}$, and $[M/\mathrm{H}]$ parameters to represent a rigorous distribution. 
+We validated the inverse routine on a stratified sample of $N=500$ held-out stars chosen
+to cover the main $T_\mathrm{eff}$, $\log g$, and $[M/\mathrm{H}]$ regimes. The full run
+completed in 252.2\,s, corresponding to a median wall time of 0.31\,s per star. Table
+~\ref{tab:backward_diagnostics} summarizes the resulting point-estimate diagnostics against
+the APOGEE labels. Biases are near zero for most quantities, while errors are smallest for
+well-constrained abundances such as Mg, Si, Ca, Mn, and Ni. The main failure mode remains
+temperature recovery in the tails of the distribution, where a small number of large
+outliers inflate the $T_\mathrm{eff}$ RMSE despite a much smaller robust error scale. In
+particular, $T_\mathrm{eff}$ shows MAD $=10.3$\,K and IQR $=20.6$\,K but
+RMSE $=218.1$\,K, while $\log g$ and $[M/\mathrm{H}]$ show the same pattern at smaller
+absolute scale (MADs 0.038 and 0.013\,dex versus RMSEs 0.107 and 0.039\,dex). The large
+RMSE--MAD gap implies a narrow, well-recovered core of stars plus a small set of
+catastrophic failures to which the squared loss is extremely sensitive.
 
-Table~\ref{tab:backward_diagnostics} illustrates our parameter estimation diagnostics tracking reconstruction fidelity against truth labels, paired with formally assigned observation uncertainties. The model's recovered labels show strong convergence. Notably, elements like $[\mathrm{Mg/Fe}]$, $[\mathrm{Al/Fe}]$, and $[\mathrm{Mn/Fe}]$ yield highly constrained estimates showcasing RMSEs of $\sim$0.13, 0.17, and 0.24 dex respectively.
-
-\begin{deluxetable}{lrrrr}
+\begin{deluxetable}{lrrrrr}
 \tablecaption{Prism Backward Inference MAP Diagnostics on $N=500$ Stratified Stars \label{tab:backward_diagnostics}}
 \tablewidth{0pt}
 \tablehead{
@@ -701,57 +813,41 @@ Table~\ref{tab:backward_diagnostics} illustrates our parameter estimation diagno
   \colhead{Bias} &
   \colhead{MAD} &
   \colhead{RMSE} &
+  \colhead{IQR} &
   \colhead{ASPCAP-$\sigma$}
 }
 \startdata
-$T_\mathrm{eff}$ (K)& 80.915 & 61.873 & 181.889 & 10.42 \\
-$\log{g}$ (dex)     & 0.208  & 0.125  & 0.366   & 0.028 \\
-$[M/\mathrm{H}]$    & 0.083  & 0.031  & 0.158   & 0.006 \\
-$[\mathrm{C/Fe}]$   & 0.160  & 0.056  & 0.261   & 0.017 \\
-$[\mathrm{N/Fe}]$   & 0.124  & 0.081  & 0.254   & 0.020 \\
-$[\mathrm{O/Fe}]$   & 0.141  & 0.052  & 0.239   & 0.021 \\
-$[\mathrm{Fe/H}]$   & 0.176  & 0.052  & 0.241   & 0.010 \\
-$[\mathrm{Mg/Fe}]$  & 0.082  & 0.044  & 0.127   & 0.013 \\
-$[\mathrm{Si/Fe}]$  & 0.113  & 0.039  & 0.165   & 0.017 \\
-$[\mathrm{Ca/Fe}]$  & 0.088  & 0.037  & 0.152   & 0.018 \\
-$[\mathrm{Al/Fe}]$  & 0.096  & 0.055  & 0.170   & 0.025 \\
-$[\mathrm{Mn/Fe}]$  & 0.176  & 0.056  & 0.243   & 0.019 \\
-$[\mathrm{Ni/Fe}]$  & 0.117  & 0.052  & 0.195   & 0.017 \\
+$T_\mathrm{eff}$ (K)& -1.974 & 10.284 & 218.104 & 20.629 & 8.894 \\
+$\log{g}$ (dex)     & 0.002  & 0.038  & 0.107   & 0.076 & 0.025 \\
+$[M/\mathrm{H}]$    & -0.002 & 0.013  & 0.039   & 0.026 & 0.007 \\
+$v_\mathrm{micro}$  & -0.013 & 0.095  & 0.146   & 0.189 & 0.000 \\
+$v_\mathrm{macro}$  & 0.003  & 0.020  & 0.258   & 0.041 & 0.000 \\
+$v\sin i$           & -0.614 & 1.752  & 3.795   & 3.748 & 0.000 \\
+$[\mathrm{C/Fe}]$   & -0.000 & 0.023  & 0.060   & 0.045 & 0.015 \\
+$[\mathrm{N/Fe}]$   & 0.005  & 0.027  & 0.143   & 0.053 & 0.018 \\
+$[\mathrm{O/Fe}]$   & -0.003 & 0.024  & 0.058   & 0.048 & 0.018 \\
+$[\mathrm{Fe/H}]$   & -0.003 & 0.013  & 0.041   & 0.027 & 0.008 \\
+$[\mathrm{Mg/Fe}]$  & -0.001 & 0.009  & 0.058   & 0.018 & 0.013 \\
+$[\mathrm{Si/Fe}]$  & -0.001 & 0.012  & 0.070   & 0.023 & 0.015 \\
+$[\mathrm{Ca/Fe}]$  & -0.001 & 0.013  & 0.054   & 0.027 & 0.015 \\
+$[\mathrm{Ti/Fe}]$  & -0.000 & 0.021  & 0.095   & 0.042 & 0.024 \\
+$[\mathrm{S/Fe}]$   & 0.002  & 0.020  & 0.078   & 0.040 & 0.044 \\
+$[\mathrm{Al/Fe}]$  & -0.002 & 0.022  & 0.096   & 0.044 & 0.020 \\
+$[\mathrm{Mn/Fe}]$  & 0.002  & 0.013  & 0.054   & 0.025 & 0.017 \\
+$[\mathrm{Ni/Fe}]$  & -0.001 & 0.012  & 0.046   & 0.024 & 0.013 \\
 \enddata
-\tablecomments{Values represent metrics tracking the convergence fidelity of MAP point estimates against baseline test ASPCAP parameters. We explicitly associate inferences with established ASPCAP formal uncertainties ($\sigma_\mathrm{ASPCAP}$) to guarantee reliable confidence bounds in downstream deployments. We restrict standard diagnostics to crucial parameter sub-samples for brevity.}
+\tablecomments{Values represent point-estimate diagnostics against ASPCAP labels for the
+current fast-MAP pipeline. The maintained notebook reports point estimates only; the
+ASPCAP column is included as an external scale reference, not as a claimed posterior
+uncertainty for Prism. Here MAD denotes the median absolute deviation from the ASPCAP
+reference label.}
 \end{deluxetable}
 
-\subsection{Comparison with Baselines}
-\label{subsec:map_baselines}
-To evaluate the impact of Prism's structural constraints during backward optimization, we incorporate a MAP inference performance comparison against the baseline architectures (see Section~\ref{subsec:baselines}). Unconstrained models (Expanded Payne) or softly constrained models (RegPayne, Ablation Prism) lack the exact analytical boundaries enforced by hard spectral masking. Consequently, when inverted via gradient descent against noisy observed spectra, these models are susceptible to parameter drifting---where flux residuals originating from one element are incorrectly compensated by adjusting structurally entangled labels.
-
-Table~\ref{tab:baseline_map_comparison} contrasts the converged MAP root-mean-square errors (RMSE) derived from tracking inference across the same $N=500$ validation stars for all models. Prism consistently yields tightly constrained parameter uncertainties, avoiding the inference degradation observed in architectures lacking inherent zero-leakage guarantees.
-
-\begin{deluxetable}{lrrrr}
-\tablecaption{MAP Inference RMSE Comparison Across Baselines ($N=500$) \label{tab:baseline_map_comparison}}
-\tablewidth{0pt}
-\tablehead{
-  \colhead{Label} &
-  \colhead{Expanded Payne} &
-  \colhead{RegPayne} &
-  \colhead{Ablation Prism} &
-  \colhead{\textbf{Prism (Ours)}}
-}
-\startdata
-$T_\mathrm{eff}$ (K)& XX.X & XX.X & XX.X & \textbf{181.9} \\
-$\log{g}$ (dex)     & X.XX & X.XX & X.XX & \textbf{0.366} \\
-$[M/\mathrm{H}]$    & X.XX & X.XX & X.XX & \textbf{0.158} \\
-$[\mathrm{C/Fe}]$   & X.XX & X.XX & X.XX & \textbf{0.261} \\
-$[\mathrm{N/Fe}]$   & X.XX & X.XX & X.XX & \textbf{0.254} \\
-$[\mathrm{O/Fe}]$   & X.XX & X.XX & X.XX & \textbf{0.239} \\
-$[\mathrm{Fe/H}]$   & X.XX & X.XX & X.XX & \textbf{0.241} \\
-$[\mathrm{Mg/Fe}]$  & X.XX & X.XX & X.XX & \textbf{0.127} \\
-$[\mathrm{Si/Fe}]$  & X.XX & X.XX & X.XX & \textbf{0.165} \\
-$[\mathrm{Ca/Fe}]$  & X.XX & X.XX & X.XX & \textbf{0.152} \\
-$[\mathrm{Ti/Fe}]$  & X.XX & X.XX & X.XX & \textbf{0.254} \\
-\enddata
-\tablecomments{Values represent the Root-Mean-Square Error (RMSE) against ASPCAP labels for extracted MAP estimates. Values denoted with 'X' represent placeholders. Prism intrinsically suppresses parameter drift via exact spectral hard masks.}
-\end{deluxetable}
+The current maintained repository does not include a synchronized cross-model inverse
+benchmark analogous to the forward comparison above. Earlier placeholder tables comparing
+MAP errors across baselines are therefore removed here. Cross-model inverse benchmarking is
+a natural next step, but the present codebase validates only the Prism MAP pipeline
+end-to-end.
 
 %------------------------------------------------------------
 \section{Discussion}
@@ -765,16 +861,13 @@ sensitivities. The architectural separation of the spectrum into continuum, mole
 atomic contributions mirrors the physical origin of these spectral components and
 provides a natural pathway for model interpretation.
 
-The information-leakage test (Section~\ref{subsec:leakage}) reveals a two-stage picture of
-disentanglement. The per-element branch architecture alone (Ablation Prism) recovers
-approximate spectral selectivity from the training data without supervision, consistent
-with the atomic physics encoded in real APOGEE spectra. This is a genuinely non-trivial
-result: the training loss contains no leakage penalty, yet the model concentrates its
-sensitivity near known atomic transitions. Prism's hard masks then enforce this selectivity
-exactly, eliminating residual cross-element leakage. The physically meaningful finding is
-therefore not Prism's guaranteed zero leakage---which follows trivially from the
-architecture---but Ablation Prism's partial recovery of spectral selectivity, which
-demonstrates that the data itself encodes the atomic physics our masks make explicit.
+The current repository points to a more nuanced trade-off than earlier drafts emphasized.
+On masked forward residuals, Prism is competitive but not universally best; several
+baseline checkpoints achieve slightly lower median $\chi^2_\mathrm{red}$. Its strongest
+empirical niche is the metal-poor giant regime, where weak-line abundances benefit most
+from strict spectral locality. The defining result is instead the leakage test:
+hard masking is the only mechanism in the present codebase that delivers exact
+zero forbidden-window response for all 14 atomic species.
 
 \subsubsection{Limitations}
 
@@ -782,8 +875,7 @@ Several limitations of the current model merit attention. First, the thermodynam
 branch introduces a degree of flexibility that, if unconstrained, could in principle absorb
 variance attributable to chemical abundances. In practice, we manage this through the
 architectural constraint that the chemical expert branch receives only the state vector
-(not raw labels), but more rigorous inspection via sensitivity analysis would strengthen
-this claim.
+(not raw labels), but more rigorous sensitivity auditing would strengthen this claim.
 
 Second, although our imputation procedure rigorously preserves data isolation across partitions by pre-fitting to the training set alone, it still introduces a 
 correlation structure into the labels that may not completely reflect true astrophysical
@@ -791,15 +883,17 @@ covariance. This could bias the thermodynamic state vector for stars with many m
 labels. A more principled treatment, such as explicit latent variable models for missing
 data, remains a natural extension.
 
-Third, unlike The Cannon 2, which delivers formal label uncertainties via the Jacobian
-of the test-step likelihood, Prism initially functioned solely as a forward emulator. However, we have since implemented a backward inference pipeline incorporating XLA-accelerated Maximum a Posteriori (MAP) estimation to recover labels from observed spectra (see Section~\ref{sec:backward_inference}).
+Third, although the repository now includes a fast backward inference pipeline, it is still
+primarily a point-estimation system. Calibrated uncertainty quantification remains under
+active development in separate Laplace, HMC, and NUTS prototypes and is not yet part of
+the mainline workflow described in this paper.
 
 Fourth, being a deterministic model, Prism does not reproduce the stochastic stellar
 variance that would exist among stars sharing the same parameters, such as variance arising
 through non-LTE physics or magnetic activity. This limits its utility as a synthetic data
 generator for population-level applications.
 
-\subsubsection{Performance in Cool Regions}
+\subsubsection{Performance in Temperature Extremes}
 
 Systematic degradation in cool regions ($T_\mathrm{eff} < 4500$\,K) is the most notable
 limitation. This stems from two factors: (i) the training sample contains relatively few
@@ -807,7 +901,22 @@ extremely cool stars (${\sim}$30\% of the dataset falls below 4500\,K), so the m
 limited exposure to this regime, and (ii) molecular physics and line lists are incomplete,
 meaning even perfect physical constraints cannot fully compensate for missing spectroscopic
 data. This is not a deficiency of our approach per se---all baselines show similar
-degradation---but rather a fundamental limitation of the underlying data.
+degradation---but rather a fundamental limitation of the underlying data. The current
+evaluation notebooks also show that hot stars ($T_\mathrm{eff}>6500$\,K) are a major
+failure mode for all models, including Prism. This is not only an out-of-distribution
+issue. In the APOGEE $H$ band, hotter atmospheres ionize many metals and dissociate the
+molecules that dominate cool-star diagnostics, so the spectrum intrinsically loses a large
+fraction of its abundance-sensitive structure. The remaining lines are often shallower and,
+for many hot stars, additionally smeared by larger projected rotation. From a physical
+standpoint, the inverse and forward problems are therefore both less identifiable in this
+regime: there is simply less chemically specific information available in the APOGEE
+wavelength range.
+
+More broadly, the near-identical shapes of the binned $\chi^2$ profiles across Prism and
+all baselines suggest that the dominant residual structure is shared. This points to a
+practical ceiling set by APOGEE's wavelength coverage, label noise, normalization systematics,
+and intrinsic information content, with architecture primarily affecting locality and
+calibration rather than radically changing the global error landscape.
 
 %------------------------------------------------------------
 \section{Future Work}
@@ -826,6 +935,11 @@ We will release a public Python class that allows users to specify a parameter s
 generate arbitrary numbers of synthetic spectra for downstream applications such as
 training data-driven classifiers or testing spectral analysis pipelines.
 
+\paragraph{Inverse uncertainty quantification.}
+The forward model now supports fast MAP inversion, but the next major step is a maintained
+uncertainty-aware inverse stack. Current prototypes include Laplace approximations and
+sampling-based HMC/NUTS approaches built around the same forward emulator.
+
 \paragraph{Extension to other surveys.}
 While trained on APOGEE H-band, the architecture is survey-agnostic. We envision
 extensions to visible-wavelength surveys (GALAH, LAMOST) and to other infrared bands,
@@ -837,29 +951,22 @@ provided appropriate training data and spectral masks are available.
 %------------------------------------------------------------
 
 We have constructed a physics-constrained generative neural emulator for APOGEE DR17
-stellar spectra. We train Prism on 149,966 real observations and achieve
-a median reduced $\chi^2_\mathrm{red} = 1.766$ on a held-out test set of $\sim$9,966
-stars, outperforming all four baselines (Table~\ref{tab:chi2}). By decomposing the
-predicted optical depth into physically motivated branches and enforcing element-specific
-weighted spectral masks, we guarantee that each chemical abundance label affects only those
-pixels associated with its known atomic transitions.
+stellar spectra. We train Prism on 149,966 real observations and, under the current
+imputation-aware masked evaluation, obtain a median reduced $\chi^2_\mathrm{red}=1.718$
+on the retained 8,938-star held-out subset. This is competitive rather than dominant in
+residual terms, but it is paired with a stronger structural guarantee than any baseline in
+the repository: exact zero leakage outside each element's permitted spectral windows.
 
-An information-leakage analysis reveals a two-stage picture: Ablation Prism's per-element
-branch architecture already recovers approximate spectral selectivity from the training
-data without supervision, while Prism's hard masks enforce this selectivity exactly.
-The physically meaningful result is that real APOGEE spectra encode sufficient element-specific
-information for an unconstrained model to recover approximate disentanglement---and that
-hard architectural constraints then eliminate the residual leakage, with measurable benefit
-to spectral fit quality.
+The present codebase therefore supports a sharpened conclusion. Hard spectral locality does
+not automatically minimize masked $\chi^2$ in every regime, but it does enforce complete
+disentanglement and appears especially valuable in weak-line settings such as metal-poor
+giants. The same repository also now demonstrates a practical inverse workflow: a
+heteroscedastic CNN warm start plus staged XLA-accelerated MAP optimization recovers labels
+for a 500-star stratified sample in 0.31\,s per star on median.
 
-Prism outperforms The Payne, Expanded Payne, Ablation Prism, and RegPayne in reduced
-$\chi^2$ while providing provable disentanglement that unconstrained baselines cannot
-achieve. The improvement is largest in the metal-poor giant regime (median $\chi^2_\mathrm{red}$
-of 1.914 versus 6.224 for The Payne), where abundance information is concentrated in weak,
-element-specific transitions that benefit most from architectural enforcement of physical
-selectivity. Prism represents a step toward spectral emulators that are simultaneously
-accurate, physically transparent, and faithful to the observational properties of the
-instruments that collect the data.
+Prism represents a step toward spectral emulators that are simultaneously competitive,
+physically transparent, and faithful to the observational properties of the instruments
+that collect the data.
 
 All code and trained model weights are available in our project repository, with
 comprehensive documentation and usage examples. We welcome community contributions and
