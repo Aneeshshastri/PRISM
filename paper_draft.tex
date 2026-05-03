@@ -44,9 +44,9 @@ advantage is structural rather than purely residual-based: an information-leakag
 returns exactly zero forbidden-region response for all 14 atomic species, while every
 baseline exhibits non-zero cross-element leakage. We further validate a fast inverse
 pipeline built around a heteroscedastic CNN warm start and XLA-compiled MAP optimization;
-on a 500-star stratified sample it achieves median wall-time 0.31\,s per star with
-RMSEs of 218\,K in $T_\mathrm{eff}$, 0.107\,dex in $\log g$, and 0.039\,dex in
-$[\mathrm{M/H}]$, but much smaller MADs of 10.3\,K, 0.038\,dex, and 0.013\,dex,
+on a 9,500-star stratified sample it achieves median wall-time 0.31\,s per star with
+RMSEs of 150\,K in $T_\mathrm{eff}$, 0.078\,dex in $\log g$, and 0.037\,dex in
+$[\mathrm{M/H}]$, but much smaller MADs of 10.8\,K, 0.034\,dex, and 0.013\,dex,
 respectively, indicating that the inverse fit is usually tight and that the inflated RMSE
 is driven by a small number of severe outliers. The resulting repository now supports a
 more nuanced conclusion: hard spectral locality yields exact disentanglement and
@@ -791,22 +791,22 @@ they are not the mainline result reported here.
 
 \subsection{Validation on Stratified Test Sample}
 \label{subsec:map_results}
-We validated the inverse routine on a stratified sample of $N=500$ held-out stars chosen
+We validated the inverse routine on a stratified sample of $N=9{,}500$ held-out stars chosen
 to cover the main $T_\mathrm{eff}$, $\log g$, and $[M/\mathrm{H}]$ regimes. The full run
-completed in 252.2\,s, corresponding to a median wall time of 0.31\,s per star. Table
+completed with a median wall time of 0.31\,s per star. Table
 ~\ref{tab:backward_diagnostics} summarizes the resulting point-estimate diagnostics against
 the APOGEE labels. Biases are near zero for most quantities, while errors are smallest for
 well-constrained abundances such as Mg, Si, Ca, Mn, and Ni. The main failure mode remains
 temperature recovery in the tails of the distribution, where a small number of large
 outliers inflate the $T_\mathrm{eff}$ RMSE despite a much smaller robust error scale. In
-particular, $T_\mathrm{eff}$ shows MAD $=10.3$\,K and IQR $=20.6$\,K but
-RMSE $=218.1$\,K, while $\log g$ and $[M/\mathrm{H}]$ show the same pattern at smaller
-absolute scale (MADs 0.038 and 0.013\,dex versus RMSEs 0.107 and 0.039\,dex). The large
+particular, $T_\mathrm{eff}$ shows MAD $=10.8$\,K and IQR $=21.6$\,K but
+RMSE $=150.2$\,K, while $\log g$ and $[M/\mathrm{H}]$ show the same pattern at smaller
+absolute scale (MADs 0.034 and 0.013\,dex versus RMSEs 0.078 and 0.037\,dex). The large
 RMSE--MAD gap implies a narrow, well-recovered core of stars plus a small set of
 catastrophic failures to which the squared loss is extremely sensitive.
 
 \begin{deluxetable}{lrrrrr}
-\tablecaption{Prism Backward Inference MAP Diagnostics on $N=500$ Stratified Stars \label{tab:backward_diagnostics}}
+\tablecaption{Prism Backward Inference MAP Diagnostics on $N=9{,}500$ Stratified Stars \label{tab:backward_diagnostics}}
 \tablewidth{0pt}
 \tablehead{
   \colhead{Label} &
@@ -817,24 +817,29 @@ catastrophic failures to which the squared loss is extremely sensitive.
   \colhead{ASPCAP-$\sigma$}
 }
 \startdata
-$T_\mathrm{eff}$ (K)& -1.974 & 10.284 & 218.104 & 20.629 & 8.894 \\
-$\log{g}$ (dex)     & 0.002  & 0.038  & 0.107   & 0.076 & 0.025 \\
-$[M/\mathrm{H}]$    & -0.002 & 0.013  & 0.039   & 0.026 & 0.007 \\
-$v_\mathrm{micro}$  & -0.013 & 0.095  & 0.146   & 0.189 & 0.000 \\
-$v_\mathrm{macro}$  & 0.003  & 0.020  & 0.258   & 0.041 & 0.000 \\
-$v\sin i$           & -0.614 & 1.752  & 3.795   & 3.748 & 0.000 \\
-$[\mathrm{C/Fe}]$   & -0.000 & 0.023  & 0.060   & 0.045 & 0.015 \\
-$[\mathrm{N/Fe}]$   & 0.005  & 0.027  & 0.143   & 0.053 & 0.018 \\
-$[\mathrm{O/Fe}]$   & -0.003 & 0.024  & 0.058   & 0.048 & 0.018 \\
-$[\mathrm{Fe/H}]$   & -0.003 & 0.013  & 0.041   & 0.027 & 0.008 \\
-$[\mathrm{Mg/Fe}]$  & -0.001 & 0.009  & 0.058   & 0.018 & 0.013 \\
-$[\mathrm{Si/Fe}]$  & -0.001 & 0.012  & 0.070   & 0.023 & 0.015 \\
-$[\mathrm{Ca/Fe}]$  & -0.001 & 0.013  & 0.054   & 0.027 & 0.015 \\
-$[\mathrm{Ti/Fe}]$  & -0.000 & 0.021  & 0.095   & 0.042 & 0.024 \\
-$[\mathrm{S/Fe}]$   & 0.002  & 0.020  & 0.078   & 0.040 & 0.044 \\
-$[\mathrm{Al/Fe}]$  & -0.002 & 0.022  & 0.096   & 0.044 & 0.020 \\
-$[\mathrm{Mn/Fe}]$  & 0.002  & 0.013  & 0.054   & 0.025 & 0.017 \\
-$[\mathrm{Ni/Fe}]$  & -0.001 & 0.012  & 0.046   & 0.024 & 0.013 \\
+$T_\mathrm{eff}$ (K)& -1.190 & 10.808 & 150.232 & 21.607 & 8.933 \\
+$\log{g}$ (dex)     & 0.002  & 0.034  & 0.078   & 0.069 & 0.025 \\
+$[M/\mathrm{H}]$    & -0.001 & 0.013  & 0.037   & 0.026 & 0.007 \\
+$v_\mathrm{micro}$  & -0.016 & 0.091  & 0.154   & 0.184 & 0.000 \\
+$v_\mathrm{macro}$  & 0.002  & 0.022  & 0.319   & 0.043 & 0.000 \\
+$v\sin i$           & -0.612 & 1.837  & 3.859   & 3.764 & 0.000 \\
+$[\mathrm{C/Fe}]$   & 0.001  & 0.022  & 0.056   & 0.044 & 0.015 \\
+$[\mathrm{N/Fe}]$   & 0.004  & 0.028  & 0.094   & 0.057 & 0.018 \\
+$[\mathrm{O/Fe}]$   & -0.001 & 0.026  & 0.057   & 0.052 & 0.018 \\
+$[\mathrm{Fe/H}]$   & -0.002 & 0.012  & 0.034   & 0.025 & 0.008 \\
+$[\mathrm{Mg/Fe}]$  & -0.001 & 0.009  & 0.039   & 0.018 & 0.013 \\
+$[\mathrm{Si/Fe}]$  & -0.001 & 0.011  & 0.050   & 0.023 & 0.015 \\
+$[\mathrm{Ca/Fe}]$  & 0.000  & 0.013  & 0.039   & 0.026 & 0.015 \\
+$[\mathrm{Ti/Fe}]$  & -0.001 & 0.020  & 0.078   & 0.040 & 0.024 \\
+$[\mathrm{S/Fe}]$   & 0.001  & 0.021  & 0.068   & 0.041 & 0.044 \\
+$[\mathrm{Al/Fe}]$  & -0.001 & 0.020  & 0.058   & 0.041 & 0.021 \\
+$[\mathrm{Mn/Fe}]$  & 0.002  & 0.014  & 0.046   & 0.027 & 0.017 \\
+$[\mathrm{Ni/Fe}]$  & -0.000 & 0.012  & 0.038   & 0.024 & 0.013 \\
+$[\mathrm{Cr/Fe}]$  & -0.003 & 0.031  & 0.141   & 0.062 & 0.045 \\
+$[\mathrm{K/Fe}]$   & 0.001  & 0.022  & 0.075   & 0.045 & 0.041 \\
+$[\mathrm{Na/Fe}]$  & -0.005 & 0.049  & 0.195   & 0.097 & 0.071 \\
+$[\mathrm{V/Fe}]$   & -0.008 & 0.058  & 0.149   & 0.116 & 0.084 \\
+$[\mathrm{Co/Fe}]$  & -0.001 & 0.018  & 0.095   & 0.037 & 0.061 \\
 \enddata
 \tablecomments{Values represent point-estimate diagnostics against ASPCAP labels for the
 current fast-MAP pipeline. The maintained notebook reports point estimates only; the
@@ -962,7 +967,7 @@ not automatically minimize masked $\chi^2$ in every regime, but it does enforce 
 disentanglement and appears especially valuable in weak-line settings such as metal-poor
 giants. The same repository also now demonstrates a practical inverse workflow: a
 heteroscedastic CNN warm start plus staged XLA-accelerated MAP optimization recovers labels
-for a 500-star stratified sample in 0.31\,s per star on median.
+for a 9,500-star stratified sample in 0.31\,s per star on median.
 
 Prism represents a step toward spectral emulators that are simultaneously competitive,
 physically transparent, and faithful to the observational properties of the instruments
