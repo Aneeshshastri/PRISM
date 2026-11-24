@@ -1,16 +1,21 @@
 """
-map_results_analysis.py — Load, report and visualise MAP inference results
-==========================================================================
-Designed to work with results.npz produced by backward_model_map.py.
+prism.analysis — load, report and visualise inverse-inference results
+=====================================================================
+(ported from map_results_analysis.py)
+
+Works with the results.npz files written by the inverse pipelines:
+backward-model.ipynb (MAP), backward-model-v3-laplace.ipynb (MAP + Laplace,
+key `inferred_errors`) and backward_model_hmc.py / backward-model-nuts.ipynb
+(MCMC, keys `lower_sigma` / `upper_sigma`).
 
 Usage (standalone):
-    python map_results_analysis.py --results path/to/results.npz
+    python -m prism.analysis --results path/to/results.npz --save-dir figures/
 
 Usage (as a library):
-    from map_results_analysis import load_map_results, report_map_results, visualise_map_results
-    data    = load_map_results("map_results/results.npz")
-    report  = report_map_results(data)
-    figs    = visualise_map_results(data, save_dir="map_results/figures")
+    from prism.analysis import load_results, report, visualise, calibration
+    data    = load_results("inverse/map_two_stage/results.npz")
+    rep     = report(data)
+    figs    = visualise(data, save_dir="figures")
 """
 
 import argparse
@@ -30,6 +35,8 @@ from matplotlib.colors import LogNorm
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────────
 
+# NOTE: every *_FE label is stored as [X/H] (FE_H is added to [X/Fe] during
+# preprocessing), so abundances are reported as [X/H].
 PRETTY_NAMES = {
     "TEFF": r"$T_{\rm eff}$ [K]",
     "LOGG": r"$\log g$",
@@ -37,23 +44,23 @@ PRETTY_NAMES = {
     "VMICRO": r"$v_{\rm micro}$ [km/s]",
     "VMACRO": r"$v_{\rm macro}$ [km/s]",
     "VSINI": r"$v \sin i$ [km/s]",
-    "C_FE": "[C/Fe]",
-    "N_FE": "[N/Fe]",
-    "O_FE": "[O/Fe]",
+    "C_FE": "[C/H]",
+    "N_FE": "[N/H]",
+    "O_FE": "[O/H]",
     "FE_H": "[Fe/H]",
-    "MG_FE": "[Mg/Fe]",
-    "SI_FE": "[Si/Fe]",
-    "CA_FE": "[Ca/Fe]",
-    "TI_FE": "[Ti/Fe]",
-    "S_FE": "[S/Fe]",
-    "AL_FE": "[Al/Fe]",
-    "MN_FE": "[Mn/Fe]",
-    "NI_FE": "[Ni/Fe]",
-    "CR_FE": "[Cr/Fe]",
-    "K_FE": "[K/Fe]",
-    "NA_FE": "[Na/Fe]",
-    "V_FE": "[V/Fe]",
-    "CO_FE": "[Co/Fe]",
+    "MG_FE": "[Mg/H]",
+    "SI_FE": "[Si/H]",
+    "CA_FE": "[Ca/H]",
+    "TI_FE": "[Ti/H]",
+    "S_FE": "[S/H]",
+    "AL_FE": "[Al/H]",
+    "MN_FE": "[Mn/H]",
+    "NI_FE": "[Ni/H]",
+    "CR_FE": "[Cr/H]",
+    "K_FE": "[K/H]",
+    "NA_FE": "[Na/H]",
+    "V_FE": "[V/H]",
+    "CO_FE": "[Co/H]",
 }
 
 CORE_LABELS  = ["TEFF", "LOGG", "M_H", "VMICRO", "VMACRO", "VSINI", "C_FE", "N_FE", "O_FE"]
@@ -61,6 +68,15 @@ ABUND_LABELS = ["FE_H", "MG_FE", "SI_FE", "CA_FE", "TI_FE", "S_FE",
                 "AL_FE", "MN_FE", "NI_FE", "CR_FE", "K_FE", "NA_FE", "V_FE", "CO_FE"]
 
 TEFF_SCALE = 100.0   # report Teff residuals in units of 100 K
+
+
+def _scale_for(name):
+    """Divisor that puts a label on a scale comparable with dex in bar charts."""
+    return TEFF_SCALE if name == "TEFF" else 1.0
+
+
+def _bar_label(name):
+    return f"{_nice_label(name)} (/{TEFF_SCALE:g})" if name == "TEFF" else _nice_label(name)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -94,7 +110,13 @@ def load_map_results(path: str) -> dict:
                    for s in raw["label_names"]]
     true      = raw["true_labels"].astype(np.float64)
     inferred  = raw["inferred_labels"].astype(np.float64)
-    inf_err   = raw["inferred_errors"].astype(np.float64) if "inferred_errors" in raw else np.zeros_like(inferred)
+    if "inferred_errors" in raw:                           # MAP + Laplace
+        inf_err = raw["inferred_errors"].astype(np.float64)
+    elif "lower_sigma" in raw and "upper_sigma" in raw:    # MCMC 16/84 percentiles
+        inf_err = 0.5 * (raw["lower_sigma"].astype(np.float64)
+                         + raw["upper_sigma"].astype(np.float64))
+    else:                                                  # point estimates only
+        inf_err = np.full_like(inferred, np.nan)
     aspcap_err = raw["aspcap_errors"].astype(np.float64)
     wall      = raw["wall_seconds"].astype(np.float64)
     gidx      = raw["global_indices"]
@@ -143,19 +165,19 @@ def report_map_results(data: dict, print_report: bool = True) -> dict:
         ie = inf_err[:, j]
         ae = aspcap_err[:, j]
         
-        # Safety for zero errors
-        safe_ie = np.where(ie > 1e-10, ie, 1e-10)
-        ratios = ae / safe_ie
-        
+        # Ratio is undefined where the model gave no (or a zero) error bar.
+        ratios = np.where(ie > 1e-10, ae / np.where(ie > 1e-10, ie, 1.0), np.nan)
+        has_err = np.any(np.isfinite(ie))
+
         report[name] = {
             "bias":              np.median(r),
             "mad":               np.median(np.abs(r - np.median(r))),
             "rmse":              np.sqrt(np.mean(r**2)),
-            "sigma_rmse":        np.sqrt(np.mean(ie**2)),
-            "sigma_mad":         np.median(np.abs(ie - np.median(ie))),
-            "ratio":             np.median(ratios),
+            "sigma_rmse":        np.sqrt(np.nanmean(ie**2)) if has_err else np.nan,
+            "sigma_mad":         np.nanmedian(np.abs(ie - np.nanmedian(ie))) if has_err else np.nan,
+            "ratio":             np.nanmedian(ratios) if np.any(np.isfinite(ratios)) else np.nan,
             "median_aspcap_err": np.median(ae),
-            "median_model_err":  np.median(ie),
+            "median_model_err":  np.nanmedian(ie) if has_err else np.nan,
             "n_stars":           n_stars,
         }
 
@@ -165,7 +187,7 @@ def report_map_results(data: dict, print_report: bool = True) -> dict:
         lines = [
             "",
             "╔═══════════════════════════════════════════════════════════════╗",
-            "║            MAP Results — Laplace Uncertainty Summary           ║",
+            "║            Inverse Results — Uncertainty Summary               ║",
             f"║  {n_stars} stars,  median wall-time = {np.median(wall):.2f} s/star{' '*(20 - len(f'{np.median(wall):.2f}'))}║",
             "╚═══════════════════════════════════════════════════════════════╝",
             "",
@@ -324,8 +346,11 @@ def plot_bias_scatter_bars(data, save_dir=None):
     residuals   = data["residuals"]
     n_labels    = len(label_names)
 
-    biases = np.array([np.median(residuals[:, j]) for j in range(n_labels)])
-    mads   = np.array([np.median(np.abs(residuals[:, j] - biases[j])) for j in range(n_labels)])
+    # TEFF (K) is divided by TEFF_SCALE so it does not swamp the dex-valued labels
+    scales = np.array([_scale_for(n) for n in label_names])
+    biases = np.array([np.median(residuals[:, j]) for j in range(n_labels)]) / scales
+    mads   = np.array([np.median(np.abs(residuals[:, j] - np.median(residuals[:, j])))
+                       for j in range(n_labels)]) / scales
 
     order = np.arange(n_labels)[::-1]
 
@@ -338,7 +363,7 @@ def plot_bias_scatter_bars(data, save_dir=None):
             error_kw=dict(lw=1, capsize=3, capthick=1, ecolor="#333"))
     ax.axvline(0, ls="-", lw=0.8, c=_C_UNITY, alpha=0.5)
     ax.set_yticks(range(n_labels))
-    ax.set_yticklabels([_nice_label(label_names[j]) for j in order], fontsize=8)
+    ax.set_yticklabels([_bar_label(label_names[j]) for j in order], fontsize=8)
     ax.set_xlabel("Median bias  ±  MAD", fontsize=10)
     ax.set_title("MAP Inference — Per-Label Bias & Scatter", fontsize=13, fontweight="bold")
     ax.tick_params(labelsize=8)
@@ -459,8 +484,9 @@ def plot_rmse_vs_aspcap(data, save_dir=None):
     aspcap_err  = data["aspcap_errors"]
     n_labels    = len(label_names)
 
-    rmses       = np.array([np.sqrt(np.mean(residuals[:, j]**2)) for j in range(n_labels)])
-    med_aspcap  = np.array([np.median(aspcap_err[:, j]) for j in range(n_labels)])
+    scales      = np.array([_scale_for(n) for n in label_names])
+    rmses       = np.array([np.sqrt(np.mean(residuals[:, j]**2)) for j in range(n_labels)]) / scales
+    med_aspcap  = np.array([np.median(aspcap_err[:, j]) for j in range(n_labels)]) / scales
 
     x = np.arange(n_labels)
     w = 0.35
@@ -471,7 +497,7 @@ def plot_rmse_vs_aspcap(data, save_dir=None):
     ax.bar(x + w/2, med_aspcap, w, label="ASPCAP median σ", color=_C_ABUND, alpha=0.65, edgecolor="white")
 
     ax.set_xticks(x)
-    ax.set_xticklabels([_nice_label(n) for n in label_names], fontsize=7, rotation=45, ha="right")
+    ax.set_xticklabels([_bar_label(n) for n in label_names], fontsize=7, rotation=45, ha="right")
     ax.set_ylabel("Error scale", fontsize=10)
     ax.set_title("MAP RMSE  vs  ASPCAP Pipeline Errors", fontsize=13, fontweight="bold")
     ax.legend(fontsize=9)
@@ -482,7 +508,7 @@ def plot_rmse_vs_aspcap(data, save_dir=None):
 
 # ---- master function ----
 
-def visualise_map_results(data: dict, save_dir: str = None) -> dict:
+def visualise_map_results(data: dict, save_dir: str = None, close: bool = False) -> dict:
     """
     Generate all diagnostic plots.
 
@@ -506,7 +532,66 @@ def visualise_map_results(data: dict, save_dir: str = None) -> dict:
 
     if save_dir:
         print(f"\n  📊  7 figures saved to {save_dir}/")
+    if close:  # free memory in long notebook sessions
+        for fig in figs.values():
+            plt.close(fig)
     return figs
+
+
+# ─────────────────────────────────────────────────────────────────
+# 4. OUTLIERS + CALIBRATION
+# ─────────────────────────────────────────────────────────────────
+
+def flag_outliers(data: dict, sigma_thresh: float = 3.0):
+    """A star is an outlier if |residual - median| > sigma_thresh * 1.4826 * MAD on ANY label."""
+    residuals = data["residuals"]
+    is_outlier = np.zeros(data["n_stars"], dtype=bool)
+    info = {}
+    for j, name in enumerate(data["label_names"]):
+        r = residuals[:, j]
+        med = np.median(r)
+        mad = max(np.median(np.abs(r - med)), 1e-8)
+        z = np.abs(r - med) / (1.4826 * mad)
+        flagged = z > sigma_thresh
+        is_outlier |= flagged
+        info[name] = {"z_scores": z, "flagged": flagged, "n_flagged": int(flagged.sum())}
+    print(f"\n  Outliers (> {sigma_thresh:.1f} robust sigma on any label): "
+          f"{int(is_outlier.sum())} / {data['n_stars']}")
+    return is_outlier, info
+
+
+def report_clean_vs_outlier(data: dict, is_outlier: np.ndarray) -> dict:
+    """RMSE of clean vs outlier stars per label (is the RMSE driven by a few failures?)."""
+    out = {}
+    print(f"\n  {'Label':<24} {'RMSE clean':>12} {'RMSE outlier':>14} {'Ratio':>8}")
+    for j, name in enumerate(data["label_names"]):
+        rc = data["residuals"][~is_outlier, j]
+        ro = data["residuals"][is_outlier, j]
+        rmse_c = float(np.sqrt(np.mean(rc ** 2))) if len(rc) else float("nan")
+        rmse_o = float(np.sqrt(np.mean(ro ** 2))) if len(ro) else float("nan")
+        ratio = rmse_o / rmse_c if rmse_c and rmse_c > 1e-10 else float("nan")
+        out[name] = {"rmse_clean": rmse_c, "rmse_outlier": rmse_o, "ratio": ratio}
+        print(f"  {_nice_label(name):<24} {rmse_c:>12.4f} {rmse_o:>14.4f} {ratio:>8.2f}")
+    return out
+
+
+def calibration(data: dict) -> dict:
+    """Per-label z = (inferred - true) / sigma statistics; needs model uncertainties."""
+    err = data["inferred_errors"]
+    if not np.any(np.isfinite(err)):
+        raise ValueError("results contain no model uncertainties (MAP-only file)")
+    out = {}
+    for j, name in enumerate(data["label_names"]):
+        e = np.maximum(err[:, j], 1e-12)
+        z = data["residuals"][:, j] / e
+        z = z[np.isfinite(z)]
+        out[name] = {"z_mean": float(np.mean(z)), "z_std": float(np.std(z)), "chi2": float(np.mean(z ** 2)),
+                     "frac_within_1sigma": float(np.mean(np.abs(z) < 1)),
+                     "frac_within_2sigma": float(np.mean(np.abs(z) < 2)),
+                     "frac_within_3sigma": float(np.mean(np.abs(z) < 3)),
+                     "median_sigma": float(np.median(e))}
+    return out
+
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -520,19 +605,30 @@ def main():
         epilog=textwrap.dedent("""\
             Example
             -------
-              python map_results_analysis.py --results map_results/results.npz
-              python map_results_analysis.py --results map_results/results.npz --save-dir map_results/figures
+              python -m prism.analysis --results results.npz
+              python -m prism.analysis --results results.npz --save-dir figures
         """),
     )
-    parser.add_argument("--results", required=True, help="Path to results.npz from backward_model_map.py")
+    parser.add_argument("--results", required=True, help="Path to results.npz from an inverse pipeline")
     parser.add_argument("--save-dir", default=None, help="Directory to save figures (PNG + PDF)")
     args = parser.parse_args()
 
     data   = load_map_results(args.results)
-    report = report_map_results(data)
+    report_map_results(data)
     figs   = visualise_map_results(data, save_dir=args.save_dir)
+    if np.any(np.isfinite(data["inferred_errors"])):
+        cal = calibration(data)
+        print("\n  Uncertainty calibration  (z = residual / sigma; ideal z_std = 1, 68% within 1 sigma)")
+        for name, c in cal.items():
+            print(f"  {_nice_label(name):<24} z_mean {c['z_mean']:>7.2f}  z_std {c['z_std']:>7.2f}  "
+                  f"within 1 sigma {100 * c['frac_within_1sigma']:>5.1f}%")
 
     print(f"\nDone. {len(figs)} figures generated.")
+
+
+load_results = load_map_results
+report = report_map_results
+visualise = visualise_map_results
 
 
 if __name__ == "__main__":

@@ -216,8 +216,10 @@ from the imputation flags. First, a 23-dimensional \texttt{bad\_mask} records wh
 labels were imputed. Second, a per-star 8575-pixel mask suppresses wavelengths associated
 with imputed C, N, O, or trace-element abundances using \texttt{apogee\_mask.npy} and the
 APOGEE \texttt{.filt} windows. These masks are serialized into the TFRecord files used by
-the active trainer, allowing both the loss and the architecture to treat imputed labels
-explicitly rather than relying on naive evaluation against filled-in targets.
+the active trainer. The pixel mask enters the loss directly: the per-pixel training loss is
+multiplied by $M_\mathrm{pix}$, so the flux residuals at the line windows of an imputed
+species contribute no gradient for that star. This, rather than any architectural gating,
+is what prevents filled-in label values from shaping the learned line responses.
 
 %------------------------------------------------------------
 \section{Model Architecture}
@@ -263,15 +265,16 @@ be explained by the opacity branches.
 
 \subsubsection{CNO (Molecular) Branch}
 The molecular branch remains dense and global. In the two-input Prism model it receives a
-concatenation of selected atmospheric, rotational, and CNO quantities, and the codebase
-supports optional per-sample \texttt{GradientGate} suppression of imputed C, N, and O
-inputs. Two dense layers of widths 256 and 1024 predict $\tau_\mathrm{CNO}$ on the full
-8575-pixel grid. As in earlier versions, we leave this branch unmasked because blended
-molecular opacity is intrinsically non-local in wavelength space. The purpose of
-\texttt{GradientGate} is not to alter the forward value of an imputed label, but to block
-back-propagated dependence on that label for the affected sample. In effect, the notebook
-lets the model consume the filled value for numerical continuity while preventing the CNO
-branch from learning spurious gradients from labels that were not actually measured.
+concatenation of selected atmospheric, rotational, and CNO quantities. Two dense layers of
+widths 256 and 1024 predict $\tau_\mathrm{CNO}$ on the full 8575-pixel grid. As in earlier
+versions, we leave this branch unmasked because blended molecular opacity is intrinsically
+non-local in wavelength space. Imputed C, N, and O values are consumed as ordinary inputs
+for numerical continuity; their influence on training is removed by the per-star pixel mask
+in the loss (Section~\ref{sec:loss}), which zeroes the residuals at the affected
+species' windows. The two-input builder still wraps these inputs in a
+\texttt{GradientGate} layer, but because that layer applies \texttt{stop\_gradient} to
+input labels, which have no trainable parameters upstream, it leaves both the forward pass
+and the weight gradients unchanged; it is retained only for checkpoint compatibility.
 
 \subsubsection{Thermodynamic State Branch}
 The thermodynamic state branch distills all global and CNO parameters into a compact
@@ -315,10 +318,10 @@ non-permitted wavelength to species $X$.
 The repository currently keeps two forward architectures side by side. The full Prism
 model is a two-input masked network using the per-label \texttt{bad\_mask}, while the
 single-input structured ablation (\texttt{build\_final\_emulator}) uses the same sparse
-atomic projectors but feeds \emph{the full input vector} into the continuum branch, the
-molecular branch, the thermodynamic state branch, and the expert multilayer perceptrons.
-It therefore removes the selective routing and gradient-gating logic of Prism while
-retaining the final masked atomic projection. The evaluation notebook loads these as
+atomic projectors but feeds \emph{the full input vector} directly into the continuum
+branch, the molecular branch, and the expert multilayer perceptrons; it has no
+thermodynamic state branch. It therefore removes the selective input routing and the
+state-vector bottleneck of Prism while retaining the final masked atomic projection. The evaluation notebook loads these as
 distinct checkpoints: \texttt{APOGEE\_SGEN.keras} for Prism and
 \texttt{SPECTROGRAM\_GENERATOR.keras} for Ablation Prism.
 
@@ -339,7 +342,7 @@ The current training notebook runs for up to 150 epochs with batch size 256, usi
 \texttt{ModelCheckpoint} and \texttt{EarlyStopping} (patience 20,
 \texttt{min\_delta}=10^{-7}). In its present executed path, the notebook instantiates
 \texttt{build\_final\_emulator}---the newer Ablation Prism baseline with masked atomic
-projection but full-input routing---rather than the two-input gated Prism model. The full
+projection but full-input routing---rather than the two-input Prism model. The full
 Prism builder remains implemented in the same notebook and is the architecture loaded as
 \texttt{APOGEE\_SGEN.keras} by the evaluation code. The other comparison models used in the
 evaluation notebook---The Payne, Expanded Payne, Ablation Prism, and RegPayne---are
@@ -448,6 +451,7 @@ repository snapshot: The Payne and RegPayne achieve slightly lower medians of 1.
 Prism delivers exact spectral locality and zero leakage, while several baselines achieve
 slightly smaller masked residuals.
 
+% NOTE: rerun RegPayne row -- the Jacobian penalty was inactive when this checkpoint was trained.
 \begin{deluxetable}{lrrr}
 \tablecaption{Masked reduced $\chi^2$ on the retained held-out test stars \label{tab:chi2}}
 \tablewidth{0pt}
@@ -564,9 +568,10 @@ the present notebook is therefore narrower but clearer: exact locality requires 
 masked final projector. Ablation Prism still leaks because the full label vector is fed
 through shared global branches, allowing abundance information to influence flux outside the
 atomic expert pathways. In the current repository, only the full two-input Prism routing
-scheme---sparse atomic projection plus restricted/gated label flow---guarantees exact
+scheme---sparse atomic projection plus restricted label flow---guarantees exact
 locality across all 14 atomic species.
 
+% NOTE: rerun RegP column -- the Jacobian penalty was inactive when this checkpoint was trained.
 \begin{deluxetable}{lrrrrr}
 \tablecaption{Information-leakage ratios ($\bar{|\nabla|}_\mathrm{forb.}/\bar{|\nabla|}_\mathrm{allow.}$) for all 14 atomic species \label{tab:leakage}}
 \tablewidth{0pt}
@@ -683,6 +688,7 @@ Our approach achieves comparable fitting accuracy on real observations with lowe
 computational cost and with physically enforced interpretability.
 
 \subsection{Baseline Comparison: Expanded Payne, Ablation Prism, and RegPayne}
+\label{sec:baselines_note}
 \label{subsec:baselines}
 
 In addition to the original Payne architecture, the repository keeps three further
@@ -699,11 +705,20 @@ it should not be over-interpreted as the final performance ceiling of the Prism 
       increasing parameter capacity without adding physics constraints;
 \item \textbf{Ablation Prism} --- a single-input Prism variant that retains the sparse
       atomic projection masks but feeds the full label vector into the continuum,
-      molecular, state, and expert networks, isolating the effect of Prism's selective
-      routing and gradient-gating logic rather than removing masking entirely;
-\item \textbf{RegPayne} --- a Payne-like model trained with a two-phase Jacobian penalty
-      schedule (phase 1: 5 epochs, $\lambda_J = 0$; phase 2: full training,
-      $\lambda_J = 400$) using the \texttt{build\_disentangled\_model} framework.
+      molecular, and expert networks (with no thermodynamic state branch), isolating the
+      effect of Prism's selective routing and state-vector bottleneck rather than removing
+      masking entirely;
+\item \textbf{RegPayne} --- a Payne-like model intended to be trained with a two-phase
+      Jacobian penalty schedule (phase 1: 5 epochs, $\lambda_J \approx 0.012$; phase 2:
+      full training, $\lambda_J \approx 1851$, both from an Optuna search) using the
+      \texttt{build\_disentangled\_model} framework. \emph{Caveat:} in the code that
+      produced the RegPayne checkpoint evaluated here, the penalty layer was not connected
+      to the model output and was therefore pruned from the training graph, and its
+      forbidden-pixel mask was inverted. The reported RegPayne numbers are thus those of an
+      unregularized Payne-architecture model, consistent with its near-identical $\chi^2$
+      and leakage values to The Payne. Both defects are fixed in the repository; RegPayne
+      (and the Optuna penalty search) must be re-run before its results can be interpreted
+      as the effect of a Jacobian penalty.
 \end{enumerate}
 
 Results are summarized in Tables~\ref{tab:chi2} and \ref{tab:chi2_stellar}. Several
@@ -742,14 +757,16 @@ TransformerPayne & Synth.\ grid & None             & No  & ---   \\
 Payne (ours)     & Real (DR17)  & None             & No  & \textbf{1.683} \\
 Expanded Payne   & Real (DR17)  & None             & No  & 1.820 \\
 Ablation Prism   & Real (DR17)  & Masked output only & Partial & 1.703 \\
-RegPayne         & Real (DR17)  & Soft (Jacobian)  & Partial & 1.687 \\
+RegPayne$^\dagger$ & Real (DR17)  & Soft (Jacobian)  & Partial & 1.687 \\
 \textbf{Prism}   & Real (DR17)  & Hard (mask + routing) & Yes & 1.718
 \enddata
 \tablecomments{Top section: published models (qualitative comparison only; dashes indicate
 no reported $\chi^2_\mathrm{red}$ on real APOGEE data). Bottom section: baselines trained
 on the same DR17 data split and evaluated with the masked held-out protocol. The best
 current median $\chi^2_\mathrm{red}$ belongs to Payne, but Prism is uniquely
-distinguished by exact zero leakage across all 14 atomic species.}
+distinguished by exact zero leakage across all 14 atomic species.
+$^\dagger$The Jacobian penalty was inactive when this checkpoint was trained (see
+Section~\ref{sec:baselines_note}); its value reflects an unregularized Payne architecture.}
 \end{deluxetable}
 
 %------------------------------------------------------------
@@ -791,8 +808,9 @@ they are not the mainline result reported here.
 
 \subsection{Validation on Stratified Test Sample}
 \label{subsec:map_results}
-We validated the inverse routine on a stratified sample of $N=9{,}500$ held-out stars chosen
-to cover the main $T_\mathrm{eff}$, $\log g$, and $[M/\mathrm{H}]$ regimes. The full run
+We validated the inverse routine on all $N=9{,}500$ stars of the held-out test block
+(indices 140{,}000--149{,}499), which span the main $T_\mathrm{eff}$, $\log g$, and
+$[M/\mathrm{H}]$ regimes. The full run
 completed with a median wall time of 0.31\,s per star. Table
 ~\ref{tab:backward_diagnostics} summarizes the resulting point-estimate diagnostics against
 the APOGEE labels. Biases are near zero for most quantities, while errors are smallest for
@@ -806,7 +824,7 @@ RMSE--MAD gap implies a narrow, well-recovered core of stars plus a small set of
 catastrophic failures to which the squared loss is extremely sensitive.
 
 \begin{deluxetable}{lrrrrr}
-\tablecaption{Prism Backward Inference MAP Diagnostics on $N=9{,}500$ Stratified Stars \label{tab:backward_diagnostics}}
+\tablecaption{Prism Backward Inference MAP Diagnostics on the $N=9{,}500$ Held-Out Stars \label{tab:backward_diagnostics}}
 \tablewidth{0pt}
 \tablehead{
   \colhead{Label} &
@@ -823,29 +841,31 @@ $[M/\mathrm{H}]$    & -0.001 & 0.013  & 0.037   & 0.026 & 0.007 \\
 $v_\mathrm{micro}$  & -0.016 & 0.091  & 0.154   & 0.184 & 0.000 \\
 $v_\mathrm{macro}$  & 0.002  & 0.022  & 0.319   & 0.043 & 0.000 \\
 $v\sin i$           & -0.612 & 1.837  & 3.859   & 3.764 & 0.000 \\
-$[\mathrm{C/Fe}]$   & 0.001  & 0.022  & 0.056   & 0.044 & 0.015 \\
-$[\mathrm{N/Fe}]$   & 0.004  & 0.028  & 0.094   & 0.057 & 0.018 \\
-$[\mathrm{O/Fe}]$   & -0.001 & 0.026  & 0.057   & 0.052 & 0.018 \\
+$[\mathrm{C/H}]$   & 0.001  & 0.022  & 0.056   & 0.044 & 0.015 \\
+$[\mathrm{N/H}]$   & 0.004  & 0.028  & 0.094   & 0.057 & 0.018 \\
+$[\mathrm{O/H}]$   & -0.001 & 0.026  & 0.057   & 0.052 & 0.018 \\
 $[\mathrm{Fe/H}]$   & -0.002 & 0.012  & 0.034   & 0.025 & 0.008 \\
-$[\mathrm{Mg/Fe}]$  & -0.001 & 0.009  & 0.039   & 0.018 & 0.013 \\
-$[\mathrm{Si/Fe}]$  & -0.001 & 0.011  & 0.050   & 0.023 & 0.015 \\
-$[\mathrm{Ca/Fe}]$  & 0.000  & 0.013  & 0.039   & 0.026 & 0.015 \\
-$[\mathrm{Ti/Fe}]$  & -0.001 & 0.020  & 0.078   & 0.040 & 0.024 \\
-$[\mathrm{S/Fe}]$   & 0.001  & 0.021  & 0.068   & 0.041 & 0.044 \\
-$[\mathrm{Al/Fe}]$  & -0.001 & 0.020  & 0.058   & 0.041 & 0.021 \\
-$[\mathrm{Mn/Fe}]$  & 0.002  & 0.014  & 0.046   & 0.027 & 0.017 \\
-$[\mathrm{Ni/Fe}]$  & -0.000 & 0.012  & 0.038   & 0.024 & 0.013 \\
-$[\mathrm{Cr/Fe}]$  & -0.003 & 0.031  & 0.141   & 0.062 & 0.045 \\
-$[\mathrm{K/Fe}]$   & 0.001  & 0.022  & 0.075   & 0.045 & 0.041 \\
-$[\mathrm{Na/Fe}]$  & -0.005 & 0.049  & 0.195   & 0.097 & 0.071 \\
-$[\mathrm{V/Fe}]$   & -0.008 & 0.058  & 0.149   & 0.116 & 0.084 \\
-$[\mathrm{Co/Fe}]$  & -0.001 & 0.018  & 0.095   & 0.037 & 0.061 \\
+$[\mathrm{Mg/H}]$  & -0.001 & 0.009  & 0.039   & 0.018 & 0.013 \\
+$[\mathrm{Si/H}]$  & -0.001 & 0.011  & 0.050   & 0.023 & 0.015 \\
+$[\mathrm{Ca/H}]$  & 0.000  & 0.013  & 0.039   & 0.026 & 0.015 \\
+$[\mathrm{Ti/H}]$  & -0.001 & 0.020  & 0.078   & 0.040 & 0.024 \\
+$[\mathrm{S/H}]$   & 0.001  & 0.021  & 0.068   & 0.041 & 0.044 \\
+$[\mathrm{Al/H}]$  & -0.001 & 0.020  & 0.058   & 0.041 & 0.021 \\
+$[\mathrm{Mn/H}]$  & 0.002  & 0.014  & 0.046   & 0.027 & 0.017 \\
+$[\mathrm{Ni/H}]$  & -0.000 & 0.012  & 0.038   & 0.024 & 0.013 \\
+$[\mathrm{Cr/H}]$  & -0.003 & 0.031  & 0.141   & 0.062 & 0.045 \\
+$[\mathrm{K/H}]$   & 0.001  & 0.022  & 0.075   & 0.045 & 0.041 \\
+$[\mathrm{Na/H}]$  & -0.005 & 0.049  & 0.195   & 0.097 & 0.071 \\
+$[\mathrm{V/H}]$   & -0.008 & 0.058  & 0.149   & 0.116 & 0.084 \\
+$[\mathrm{Co/H}]$  & -0.001 & 0.018  & 0.095   & 0.037 & 0.061 \\
 \enddata
 \tablecomments{Values represent point-estimate diagnostics against ASPCAP labels for the
 current fast-MAP pipeline. The maintained notebook reports point estimates only; the
 ASPCAP column is included as an external scale reference, not as a claimed posterior
 uncertainty for Prism. Here MAD denotes the median absolute deviation from the ASPCAP
-reference label.}
+reference label. Abundances are compared as $[X/\mathrm{H}]$, the space in which the
+emulator is trained (Section~\ref{sec:data}); the ASPCAP column lists the catalogue
+$[X/\mathrm{Fe}]$ uncertainties, so it is only an approximate scale for those rows.}
 \end{deluxetable}
 
 The current maintained repository does not include a synchronized cross-model inverse

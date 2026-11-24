@@ -35,8 +35,9 @@ tfb = tfp.bijectors
 
 class Config:
     H5_PATH    = "/kaggle/input/datasets/aneeshshastri/aspcapstar-dr17-150kstars/apogee_dr17_parallel.h5"
-    TFREC_DIR  = "/kaggle/working/tfrecords"
-    STATS_PATH = "/kaggle/working/dataset_stats.npz"
+    # Imputer fitted on the TRAINING split only (saved by model-trainer.ipynb).
+    # Truth labels for test stars must be transformed with it, not re-fitted.
+    IMPUTER_PATH = "/kaggle/input/models/aneeshshastri/stargen-comparision/tensorflow2/default/14/imputer.pkl"
     start = 140_000
     end   = 149_500
     TESTING_MODE  = True
@@ -185,21 +186,23 @@ class TrainableCNNPredictor(HeteroscedasticCNNPredictor):
 # ================================================================
 
 def get_clean_imputed_data(h5_path, selected_labels, limit=None):
+    """Returns (labels_27_physical, bad_mask). bad_mask[i, j] is True where
+    label j of star i was flagged/missing and therefore imputed."""
     print("Read data for imputation")
     with h5py.File(h5_path, 'r') as f:
         get_col = lambda k: f['metadata'][k]
         keys = f['metadata'].dtype.names
-        raw_values = np.stack([get_col(p) for p in selected_labels], axis=1)
-        bad_mask = np.zeros_like(raw_values, dtype=bool)
+        raw_values = np.stack([get_col(p) for p in selected_labels], axis=1).astype(np.float64)
+        bad_mask = ~np.isfinite(raw_values)
         for i, label in enumerate(selected_labels):
             flag_name = f"{label}_FLAG"
             if flag_name in keys:
                 flg = get_col(flag_name)
                 if flg.dtype.names: flg = flg[flg.dtype.names[0]]
                 if flg.dtype.kind == 'V': flg = flg.view('<i4')
-                bad_mask[:, i] = (flg.astype(int) != 0)
-            elif label in ['TEFF', 'LOGG', 'VMICRO', 'VMACRO', 'VSINI']:
-                bad_mask[:, i] = (raw_values[:, i] < -5000)
+                bad_mask[:, i] |= (flg.astype(int) != 0)
+            elif label in ['TEFF', 'LOGG', 'M_H', 'VMICRO', 'VMACRO', 'VSINI']:
+                bad_mask[:, i] |= (raw_values[:, i] < -5000)
 
     if limit:
         raw_values = raw_values[:limit]
@@ -207,8 +210,18 @@ def get_clean_imputed_data(h5_path, selected_labels, limit=None):
 
     vals_to_impute = raw_values.copy()
     vals_to_impute[bad_mask] = np.nan
-    imputer = IterativeImputer(estimator=BayesianRidge(), max_iter=10, initial_strategy='median')
-    clean_labels = imputer.fit_transform(vals_to_impute)
+    if os.path.exists(config.IMPUTER_PATH):
+        import joblib
+        print(f"Using train-only imputer from {config.IMPUTER_PATH}")
+        imputer = joblib.load(config.IMPUTER_PATH)
+        clean_labels = imputer.transform(vals_to_impute)
+    else:
+        print("WARNING: train-only imputer not found; fitting on all stars "
+              "(test-set truth labels will be transductively imputed).")
+        imputer = IterativeImputer(estimator=BayesianRidge(), max_iter=10,
+                                   initial_strategy='median',
+                                   random_state=config.RANDOM_SEED)
+        clean_labels = imputer.fit_transform(vals_to_impute)
 
     fe_h_col = clean_labels[:, config.FE_H_INDEX:config.FE_H_INDEX+1]
     for idx in config.ABUNDANCE_INDICES:
@@ -232,9 +245,11 @@ def get_clean_imputed_data(h5_path, selected_labels, limit=None):
     clean_labels = np.hstack([clean_labels, (0.5*g_vals + 0.5*m_vals).reshape(-1, 1)])
 
     print(f"Transformation Complete. Final Input Shape: {clean_labels.shape}")
-    return clean_labels
+    return clean_labels, bad_mask
 
 def get_err(h5_path, selected_labels, limit=None):
+    """Load ASPCAP `<LABEL>_ERR` columns; flagged / sentinel / non-finite
+    errors are replaced by the column's 95th percentile."""
     with h5py.File(h5_path, 'r') as f:
         get_col = lambda k: f['metadata'][k]
         keys = f['metadata'].dtype.names
@@ -242,23 +257,25 @@ def get_err(h5_path, selected_labels, limit=None):
             get_col(p) if p not in ['VMACRO_ERR','VMICRO_ERR','VSINI_ERR']
             else np.zeros_like(get_col('TEFF_ERR'))
             for p in selected_labels
-        ], axis=1)
-        bad_mask = np.zeros_like(raw_values, dtype=bool)
-        for i, label in enumerate(selected_labels):
+        ], axis=1).astype(np.float64)
+        bad_mask = ~np.isfinite(raw_values) | (raw_values < 0)   # -9999 sentinels
+        for i, err_name in enumerate(selected_labels):
+            # Flags are keyed on the label, not the error column
+            # ('TEFF_FLAG', not 'TEFF_ERR_FLAG').
+            label = err_name[:-len('_ERR')] if err_name.endswith('_ERR') else err_name
             flag_name = f"{label}_FLAG"
             if flag_name in keys:
                 flg = get_col(flag_name)
                 if flg.dtype.names: flg = flg[flg.dtype.names[0]]
                 if flg.dtype.kind == 'V': flg = flg.view('<i4')
-                bad_mask[:, i] = (flg.astype(int) != 0)
-            elif label in ['TEFF', 'LOGG', 'VMICRO', 'VMACRO', 'VSINI']:
-                bad_mask[:, i] = (raw_values[:, i] < -5000)
+                bad_mask[:, i] |= (flg.astype(int) != 0)
         if limit:
             raw_values = raw_values[:limit]
             bad_mask = bad_mask[:limit]
     vals_to_impute = raw_values.copy()
     vals_to_impute[bad_mask] = np.nan
     p95 = np.nanpercentile(vals_to_impute, 95, axis=0)
+    p95 = np.where(np.isfinite(p95), p95, 0.0)   # all-bad column (e.g. VMACRO_ERR)
     return np.where(np.isnan(vals_to_impute), p95, vals_to_impute)
 
 # ================================================================
@@ -283,9 +300,10 @@ with np.load(stats_path) as data:
     MEAN_TENSOR = data['mean'].astype(np.float32)
     STD_TENSOR  = data['std'].astype(np.float32)
 
-labels    = get_clean_imputed_data(h5_path, config.SELECTED_LABELS)
+labels, labels_imputed = get_clean_imputed_data(h5_path, config.SELECTED_LABELS)
 label_err = get_err(h5_path, config.ERRORS)[config.start:config.end]
 labels    = ((labels - MEAN_TENSOR) / STD_TENSOR)[config.start:config.end]
+labels_imputed = labels_imputed[config.start:config.end]
 
 # Load forward model and rebuild in FP32
 model_raw = tf.keras.models.load_model(model_path)
@@ -313,7 +331,7 @@ def cnn_predict_physical(flux_batch):
         tf.constant(flux_clean, dtype=tf.float32), training=False
     )
     mu_phys = mu_norm.numpy() * CNN_LABEL_STD + CNN_LABEL_MEAN
-    var_norm = tf.nn.softplus(raw_logvar).numpy() + 1e-4
+    var_norm = tf.nn.softplus(raw_logvar).numpy() + 1e-5   # = VAR_FLOOR in CNN training
     std_phys = np.sqrt(var_norm) * CNN_LABEL_STD
     std_phys = np.maximum(std_phys, 0.01 * CNN_LABEL_STD)
     return mu_phys.astype(np.float32), std_phys.astype(np.float32)
@@ -374,15 +392,23 @@ bounds_high = tf.constant(upper_bounds, dtype=tf.float32)
 
 # Element pixel masks
 _raw_mask = np.load(apogee_mask_path)
+# Elements with very few line pixels (e.g. S_FE) are still fit on their own
+# pixels only.  Falling back to the full spectrum would let the emulator's
+# spurious sensitivity elsewhere drive the fit.  Elements with NO line pixels
+# are not fit at all; the CNN prediction is kept (see SKIPPED_ELEMENTS).
 ELEMENT_PIXEL_MASKS = {}
+SKIPPED_ELEMENTS = set()
 for abund_idx in ABUND_INDICES:
     mask_col = _raw_mask[:, abund_idx]
     sensitive = (mask_col > 0.01).astype(np.float32)
-    if sensitive.sum() < 10:
-        sensitive = np.ones(N_PIXELS, dtype=np.float32)
-        print(f"  ⚠ {LABEL_NAMES[abund_idx]} has <10 pixels, using full spectrum")
+    n_sens = int(sensitive.sum())
+    if n_sens == 0:
+        SKIPPED_ELEMENTS.add(abund_idx)
+        print(f"  ⚠ {LABEL_NAMES[abund_idx]} has no line pixels, keeping CNN value")
+    elif n_sens < 10:
+        print(f"  ⚠ {LABEL_NAMES[abund_idx]} has only {n_sens} line pixels")
     ELEMENT_PIXEL_MASKS[abund_idx] = tf.constant(sensitive, tf.float32)
-    print(f"  {LABEL_NAMES[abund_idx]:>6s}: {int(sensitive.sum()):>5d} sensitive pixels")
+    print(f"  {LABEL_NAMES[abund_idx]:>6s}: {n_sens:>5d} sensitive pixels")
 
 # ================================================================
 # FEATURE ENGINEERING
@@ -450,7 +476,8 @@ def core_log_prob_fn(theta_core, obs_flux, obs_ivar):
 
     model_flux = model_pure_fp32(labels_norm, training=False)
     model_flux = tf.cast(model_flux, tf.float32)
-    model_flux = tf.squeeze(model_flux, axis=-1)  # safe for (B,8575) or (B,8575,1)
+    if model_flux.shape.rank == 3:                # (B,8575,1) -> (B,8575)
+        model_flux = tf.squeeze(model_flux, axis=-1)
 
     obs_flux_rep = tf.repeat(obs_flux, num_chains, axis=0)
     obs_ivar_rep = tf.repeat(obs_ivar, num_chains, axis=0)
@@ -505,7 +532,8 @@ def element_log_prob_fn(theta_1d, obs_flux, obs_ivar):
 
     model_flux = model_pure_fp32(labels_norm, training=False)
     model_flux = tf.cast(model_flux, tf.float32)
-    model_flux = tf.squeeze(model_flux, axis=-1)
+    if model_flux.shape.rank == 3:
+        model_flux = tf.squeeze(model_flux, axis=-1)
 
     obs_flux_rep = tf.repeat(obs_flux, num_chains, axis=0)
     obs_ivar_rep = tf.repeat(obs_ivar, num_chains, axis=0)
@@ -569,11 +597,14 @@ def make_init_state_core(batch_stars, num_chains, physical_init_23):
     return tf.clip_by_value(base + jitter, core_low, core_high)
 
 
-def make_init_state_elem(batch_stars, num_chains, phys_value_1d):
+def make_init_state_elem(batch_stars, num_chains, phys_value_1d, lo, hi):
+    """Initial state in physical units, clipped strictly inside (lo, hi) so the
+    logit of the sigmoid bijector stays finite."""
+    margin = 1e-3
     base = tf.reshape(tf.cast(phys_value_1d, tf.float32), [1, -1, 1])
     base = tf.tile(base, [num_chains, 1, 1])
     jitter = tf.random.normal(tf.shape(base)) * 0.02
-    return base + jitter
+    return tf.clip_by_value(base + jitter, lo + margin, hi - margin)
 
 # ================================================================
 # HMC SAMPLING — XLA COMPILED (the key difference from NUTS)
@@ -591,10 +622,12 @@ _init_core_var = tf.Variable(
 def sample_core_compiled():
     """Fixed-step HMC for Stage 1: 9D core physics, full spectrum. XLA compiled."""
     def log_prob_closure(theta_unc):
+        # Sampling happens in unconstrained (logit) space, so the density must
+        # include log|d theta_phys / d theta_unc| or mass piles up near bounds.
         return core_log_prob_fn(
             _core_bijector.forward(theta_unc),
             _obs_flux_var, _obs_ivar_var
-        )
+        ) + _core_bijector.forward_log_det_jacobian(theta_unc, event_ndims=1)
 
     step_size = tf.fill([1, BATCH_SIZE_STARS, N_CORE], 0.01)
     hmc = tfp.mcmc.HamiltonianMonteCarlo(
@@ -639,7 +672,7 @@ def sample_element_compiled():
         return element_log_prob_fn(
             elem_bij.forward(theta_unc),
             _obs_flux_var, _obs_ivar_var
-        )
+        ) + elem_bij.forward_log_det_jacobian(theta_unc, event_ndims=1)
 
     step_size = tf.fill([1, BATCH_SIZE_STARS, 1], 0.01)
     hmc = tfp.mcmc.HamiltonianMonteCarlo(
@@ -683,10 +716,10 @@ def run_core_mcmc(obs_flux, obs_ivar, physical_init_23, cnn_mean, cnn_std):
     samples_unc, is_accepted = sample_core_compiled()
     samples_phys = _core_bijector.forward(samples_unc)
 
-    r_hat = tf.reduce_mean(
-        tfp.mcmc.diagnostic.potential_scale_reduction(
-            samples_phys, independent_chain_ndims=1
-        ), axis=0
+    # (B, 9) per star and parameter; never average over stars, because that
+    # would hide a single non-converged star.
+    r_hat = tfp.mcmc.diagnostic.potential_scale_reduction(
+        samples_phys, independent_chain_ndims=1
     ).numpy()
 
     n_total = NUM_RESULTS_CORE * NUM_CHAINS_CORE
@@ -712,7 +745,8 @@ def run_element_mcmc(obs_flux, obs_ivar, fixed_labels_23, elem_idx, cnn_mean, cn
     _elem_high_var.assign(bounds_high[elem_idx])
 
     init_val = cnn_mean[:, elem_idx]
-    init_state = make_init_state_elem(BATCH_SIZE_STARS, NUM_CHAINS_ELEM, init_val)
+    init_state = make_init_state_elem(BATCH_SIZE_STARS, NUM_CHAINS_ELEM, init_val,
+                                      bounds_low[elem_idx], bounds_high[elem_idx])
 
     _obs_flux_var.assign(obs_flux)
     _obs_ivar_var.assign(obs_ivar)
@@ -729,11 +763,9 @@ def run_element_mcmc(obs_flux, obs_ivar, fixed_labels_23, elem_idx, cnn_mean, cn
     ])
     samples_phys = bij.forward(samples_unc)
 
-    r_hat = tf.reduce_mean(
-        tfp.mcmc.diagnostic.potential_scale_reduction(
-            samples_phys, independent_chain_ndims=1
-        )
-    ).numpy()
+    r_hat = tfp.mcmc.diagnostic.potential_scale_reduction(
+        samples_phys, independent_chain_ndims=1
+    ).numpy()[:, 0]                                  # (B,)
 
     n_total = NUM_RESULTS_ELEM * NUM_CHAINS_ELEM
     flat = tf.reshape(samples_phys, [n_total, -1, 1])
@@ -750,16 +782,25 @@ def run_element_mcmc(obs_flux, obs_ivar, fixed_labels_23, elem_idx, cnn_mean, cn
 # CHECKPOINT / RESULTS
 # ================================================================
 
-def load_checkpoint():
+def load_checkpoint(test_indices):
     fresh = {
         'global_indices': [], 'true_labels': [], 'inferred_labels': [],
         'lower_sigma': [], 'upper_sigma': [], 'aspcap_errors': [],
+        'true_label_imputed': [],
         'acceptance_rates': [], 'r_hat': [], 'wall_seconds': [],
     }
     if os.path.exists(CHECKPOINT_PATH):
         data = np.load(CHECKPOINT_PATH, allow_pickle=True)
+        missing = [k for k in fresh if k not in data]
+        done_idx = np.asarray(data['global_indices']) if 'global_indices' in data else np.array([])
+        n_done = len(done_idx)
+        # Only resume if the checkpoint was produced for the same star list.
+        if missing or n_done > len(test_indices) or \
+                not np.array_equal(done_idx, np.asarray(test_indices)[:n_done]):
+            print(f"  ⚠ Checkpoint {CHECKPOINT_PATH} does not match this run "
+                  f"(missing keys={missing}); starting fresh.")
+            return fresh, 0
         results = {k: list(data[k]) for k in fresh}
-        n_done = len(results['global_indices'])
         print(f"  Resuming from checkpoint: {n_done} stars already done.")
         return results, n_done
     return fresh, 0
@@ -778,13 +819,20 @@ def save_final_results(results):
 # ================================================================
 
 def run_inference_pipeline(test_indices, true_labels_norm, aspcap_errors,
-                           flux_array, ivar_array):
+                           flux_array, ivar_array, true_label_imputed=None):
+    """All per-star arrays must be aligned with `test_indices` (row i of each
+    array belongs to star test_indices[i])."""
     n_stars = len(test_indices)
+    for name, arr in [('true_labels_norm', true_labels_norm), ('aspcap_errors', aspcap_errors),
+                      ('flux_array', flux_array), ('ivar_array', ivar_array)]:
+        assert len(arr) == n_stars, f"{name} has {len(arr)} rows, expected {n_stars}"
+    if true_label_imputed is None:
+        true_label_imputed = np.zeros((n_stars, N_LABELS_RAW), dtype=bool)
     true_labels_physical = (
         true_labels_norm[:, :N_LABELS_RAW] * STD_TENSOR[:N_LABELS_RAW]
         + MEAN_TENSOR[:N_LABELS_RAW]
     )
-    results, n_done = load_checkpoint()
+    results, n_done = load_checkpoint(test_indices)
     remaining_local = list(range(n_done, n_stars))
 
     print(f"\n{'='*65}")
@@ -822,7 +870,8 @@ def run_inference_pipeline(test_indices, true_labels_norm, aspcap_errors,
             batch_flux, batch_ivar, cnn_mu, cnn_mu, cnn_sig
         )
         t_s1_elapsed = time.time() - t_s1
-        s1_tag = "✓" if s1_rhat.max() < 1.05 else f"⚠ {s1_rhat.max():.3f}"
+        s1_rhat_max = s1_rhat[:actual_batch].max()      # ignore padded stars
+        s1_tag = "✓" if s1_rhat_max < 1.05 else f"⚠ {s1_rhat_max:.3f}"
         print(f"    S1 core: acc={s1_acc:.2f}  R̂ {s1_tag}  {t_s1_elapsed:.1f}s")
 
         fixed_23 = cnn_mu.copy()
@@ -837,6 +886,13 @@ def run_inference_pipeline(test_indices, true_labels_norm, aspcap_errors,
         s2_rhats, s2_accs = [], []
 
         for ai, elem_idx in enumerate(ABUND_INDICES):
+            if elem_idx in SKIPPED_ELEMENTS:
+                # No line pixels: keep the CNN estimate and its 1-sigma.
+                abund_med[:, ai] = cnn_mu[:, elem_idx]
+                abund_lo[:, ai]  = cnn_sig[:, elem_idx]
+                abund_hi[:, ai]  = cnn_sig[:, elem_idx]
+                s2_rhats.append(np.full(BATCH_SIZE_STARS, np.nan, np.float32))
+                continue
             e_med, e_lo, e_hi, e_acc, e_rhat = run_element_mcmc(
                 batch_flux, batch_ivar, fixed_23, elem_idx, cnn_mu, cnn_sig
             )
@@ -848,7 +904,8 @@ def run_inference_pipeline(test_indices, true_labels_norm, aspcap_errors,
             fixed_23[:, elem_idx] = e_med
 
         t_s2_elapsed = time.time() - t_s2
-        s2_tag = "✓" if max(s2_rhats) < 1.05 else f"⚠ {max(s2_rhats):.3f}"
+        s2_rhat_max = np.nanmax(np.stack(s2_rhats)[:, :actual_batch])
+        s2_tag = "✓" if s2_rhat_max < 1.05 else f"⚠ {s2_rhat_max:.3f}"
         print(f"    S2 elem: acc={np.mean(s2_accs):.2f}  R̂ {s2_tag}  "
               f"{t_s2_elapsed:.1f}s  ({N_ABUND} elements)")
 
@@ -856,19 +913,19 @@ def run_inference_pipeline(test_indices, true_labels_norm, aspcap_errors,
         full_med  = np.zeros((BATCH_SIZE_STARS, N_LABELS_RAW), np.float32)
         full_lo   = np.zeros((BATCH_SIZE_STARS, N_LABELS_RAW), np.float32)
         full_hi   = np.zeros((BATCH_SIZE_STARS, N_LABELS_RAW), np.float32)
-        full_rhat = np.zeros(N_LABELS_RAW, np.float32)
+        full_rhat = np.zeros((BATCH_SIZE_STARS, N_LABELS_RAW), np.float32)
 
         for ci, gi in enumerate(CORE_INDICES):
             full_med[:, gi] = core_med[:, ci]
             full_lo[:, gi]  = core_lo[:, ci]
             full_hi[:, gi]  = core_hi[:, ci]
-            full_rhat[gi]   = s1_rhat[ci]
+            full_rhat[:, gi] = s1_rhat[:, ci]
 
         for ai, gi in enumerate(ABUND_INDICES):
             full_med[:, gi] = abund_med[:, ai]
             full_lo[:, gi]  = abund_lo[:, ai]
             full_hi[:, gi]  = abund_hi[:, ai]
-            full_rhat[gi]   = s2_rhats[ai]
+            full_rhat[:, gi] = s2_rhats[ai]
 
         elapsed = t_s1_elapsed + t_s2_elapsed
         avg_acc = (s1_acc + np.mean(s2_accs)) / 2
@@ -882,8 +939,12 @@ def run_inference_pipeline(test_indices, true_labels_norm, aspcap_errors,
             results['lower_sigma'].append(full_lo[b])
             results['upper_sigma'].append(full_hi[b])
             results['aspcap_errors'].append(aspcap_errors[local_idx, :N_LABELS_RAW])
+            results['true_label_imputed'].append(true_label_imputed[local_idx, :N_LABELS_RAW])
             results['acceptance_rates'].append(avg_acc)
-            results['r_hat'].append(full_rhat)
+            results['r_hat'].append(full_rhat[b])          # per-star, per-label
+            if np.nanmax(full_rhat[b]) > 1.05:
+                print(f"    ⚠ star {global_idx}: max R̂ = {np.nanmax(full_rhat[b]):.3f} "
+                      f"(not converged; treat its posterior summary with caution)")
             results['wall_seconds'].append(elapsed / actual_batch)
 
         n_done += actual_batch
@@ -958,9 +1019,12 @@ if __name__ == "__main__":
             extra = rng.choice(remaining, size=min(shortfall, len(remaining)), replace=False)
             local_indices_selected = np.concatenate([local_indices_selected, extra])
         elif n_from_bins > target_n:
-            occupancies = np.array([b['n_stars'] for b in bin_summary])
-            order = np.argsort(occupancies)
-            local_indices_selected = local_indices_selected[order[:target_n]]
+            # More occupied bins than stars requested: pick bins at random
+            # (seeded). Taking the least-populated bins would select only
+            # edge-of-grid outliers.
+            rng = np.random.default_rng(42)
+            keep = rng.choice(n_from_bins, size=target_n, replace=False)
+            local_indices_selected = local_indices_selected[np.sort(keep)]
 
         global_indices = np.sort(local_indices_selected + test_start)
         print(f"Selected {len(global_indices)} test stars.")
@@ -970,16 +1034,22 @@ if __name__ == "__main__":
     TEST_END   = 149_500
 
     global_indices = select_stratified_test_sample(
-        config.H5_PATH, config.STATS_PATH, config.SELECTED_LABELS,
+        config.H5_PATH, stats_path, config.SELECTED_LABELS,
         TEST_START, TEST_END, target_n=TOTAL_STARS, logg_bins=5, teff_bins=10, mh_bins=10,
     )
     np.save("test_indices.npy", global_indices)
 
     test_indices = np.load("test_indices.npy")
+    # `labels`, `label_err`, `real_data`, `real_data_ivar` all hold the slice
+    # [config.start, config.end); convert global ids to rows of that slice so
+    # the stars fitted are the stars recorded in `global_indices`.
+    assert TEST_START == config.start
+    sel = test_indices - config.start
     results = run_inference_pipeline(
         test_indices=test_indices,
-        true_labels_norm=labels,
-        aspcap_errors=label_err,
-        flux_array=real_data,
-        ivar_array=real_data_ivar,
+        true_labels_norm=labels[sel],
+        aspcap_errors=label_err[sel],
+        flux_array=real_data[sel],
+        ivar_array=real_data_ivar[sel],
+        true_label_imputed=labels_imputed[sel],
     )

@@ -1,14 +1,18 @@
 """
 apogee_mask_loader.py
 
-Reads APOGEE element-filter (.filt) files, converts them from 7514-pixel
-(chip-gap-excluded) format to the full 8575-pixel detector range, and
-assembles an apogee_mask.npy matching the jacobian_mask.npy layout used
-by model-trainer.ipynb.
+Reads per-element APOGEE window files (`element masks/<El>.mask`; the
+`element filters/<El>.filt` files share the same format), converts them from
+the 7514-pixel (chip-gap-excluded) grid to the full 8575-pixel detector range,
+and assembles an (8575, 27) mask array with one column per model input
+(column order = LABELS_ORDER, identical to model-trainer.ipynb).
 
-Output shape: (8575, N_LABELS)  –  same as jacobian_mask.npy
-Convention :  0.0 = line present / allowed,  higher values = forbidden.
-Global labels (TEFF, LOGG, …, engineered features) are set to 0.0 everywhere.
+Default output: apogee_inference_mask.npy (apogee_mask.npy has the same layout).
+Convention : values are line weights in [0, 1]; > 0 means the pixel lies in a
+             line window of that element ("allowed"/"sensitive"), 0 means it
+             does not.  Consumers threshold at > 0.01.
+Columns without a window file (TEFF, LOGG, …, C/N/O and the engineered
+features) are all zeros.
 """
 
 import os
@@ -72,18 +76,18 @@ def insert_gaps(window_7514):
 # ── Main builder ─────────────────────────────────────────────────────────
 def build_apogee_mask(filt_dir='element masks', output_path='apogee_inference_mask.npy'):
     """
-    Build the apogee_mask array from .filt files and save it.
+    Build the apogee mask array from per-element .mask files and save it.
 
     Parameters
     ----------
     filt_dir : str
-        Directory containing {Element}.filt files.
+        Directory containing {Element}.mask files.
     output_path : str
         Where to save the resulting .npy file.
 
     Returns
     -------
-    mask : np.ndarray, shape (8575, N_LABELS)
+    mask : np.ndarray, shape (8575, 27); > 0 marks line pixels
     """
     n_labels = len(LABELS_ORDER)
     mask = np.zeros((N_PIXELS_FULL, n_labels), dtype=np.float32)
