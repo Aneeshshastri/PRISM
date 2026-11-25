@@ -51,7 +51,8 @@ def load_model(path: Path) -> nnx.Module:
     meta = load_meta(path)
     idx_file = path / "element_idx.npz"
     element_idx = _load_element_idx(idx_file) if idx_file.exists() else None
-    model = build_model(meta["name"], element_idx, seed=int(meta.get("seed", 0)))
+    # no "arch" in meta -> legacy architecture (checkpoints from before the options existed)
+    model = build_model(meta["name"], element_idx, seed=int(meta.get("seed", 0)), arch=meta.get("arch"))
     target = jax.tree.map(ocp.utils.to_shape_dtype_struct, nnx.state(model))
     with ocp.StandardCheckpointer() as ckpt:
         restored = ckpt.restore(path / "state", target)

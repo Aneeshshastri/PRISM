@@ -3,7 +3,11 @@
 * reduced chi^2 on the held-out test split, plain and imputation-masked
 * imputed-vs-natural chi^2 per label
 * median masked chi^2 per stellar population (paper Table tab:chi2_stellar)
-* information leakage: |dF/d[X/H]| outside vs inside each element's line windows
+* information leakage: |dF/d[X/H]| outside vs inside each element's line windows (chip gaps
+  excluded; C/N/O against the union of the C/N/O windows)
+* chi^2 per spectral region (element windows / C-N-O-only windows / unassigned) per Teff group
+* wrong-sign fraction: share of the response to an element's own abundance, inside its own
+  windows, that makes lines shallower (more X should deepen X's lines)
 """
 
 from __future__ import annotations
@@ -16,6 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from prism.config import ATOMIC_LABELS, CNO_LABELS, CORE_LABELS, FEH_LABELS, LABELS_27, SELECTED_LABELS, TRACE_LABELS
+from prism.data.masks import gap_mask
 from prism.losses import reduced_chi2
 from prism.mesh import data_sharding, n_devices, pad_to_multiple, replicate
 from prism.models.functional import make_flux_fn
@@ -56,8 +61,26 @@ def _chi2_chunks(pred, flux, ivar, extra=None, chunk: int = 512) -> np.ndarray:
     return np.concatenate(res)
 
 
-def chi2_table(models: dict, test: dict, apogee_mask: np.ndarray, mesh, threshold: float = 0.01) -> dict:
-    """Plain and masked reduced chi^2 per model.
+def _region_chi2(pred, flux, ivar, extra, regions: dict[str, np.ndarray], var_floor: float = 1e-5,
+                 badpix_cutoff: float = 1e-3, chunk: int = 512) -> np.ndarray:
+    """(N, R) mean chi^2 per pixel within each region (same pixel validity as ``reduced_chi2``)."""
+    reg = np.stack([np.asarray(r, np.float64) for r in regions.values()], axis=1)  # (P, R)
+    out = []
+    for s in range(0, len(pred), chunk):
+        f = np.asarray(flux[s:s + chunk], np.float64)
+        iv = np.asarray(ivar[s:s + chunk], np.float64)
+        ok = np.isfinite(f) & np.isfinite(iv) & (iv > 0) & (f > badpix_cutoff)
+        if extra is not None:
+            ok &= np.asarray(extra[s:s + chunk]) > 0
+        var = 1.0 / np.where(ok, iv, 1.0) + var_floor
+        chi = np.where(ok, (np.asarray(pred[s:s + chunk], np.float64) - np.where(ok, f, 0.0)) ** 2 / var, 0.0)
+        out.append((chi @ reg) / np.maximum(ok.astype(np.float64) @ reg, 1.0))
+    return np.concatenate(out)
+
+
+def chi2_table(models: dict, test: dict, apogee_mask: np.ndarray, mesh, threshold: float = 0.01,
+               regions: dict[str, np.ndarray] | None = None) -> dict:
+    """Plain and masked reduced chi^2 per model (+ masked per-region chi^2 with ``regions``).
 
     Masked protocol: drop stars with any imputed core/CNO/FE_H label; for kept
     stars, remove the line pixels of every imputed trace element.
@@ -80,6 +103,9 @@ def chi2_table(models: dict, test: dict, apogee_mask: np.ndarray, mesh, threshol
             "chi2": _chi2_chunks(pred, test["flux"], test["ivar"]),
             "chi2_masked": _chi2_chunks(pred[valid], test["flux"][valid], test["ivar"][valid], extra),
         }
+        if regions:
+            out[name]["region_chi2"] = _region_chi2(pred[valid], test["flux"][valid], test["ivar"][valid], extra,
+                                                    regions)
     return out
 
 
@@ -106,35 +132,116 @@ def population_table(chi2_masked: dict[str, np.ndarray], phys_labels: np.ndarray
     return table
 
 
-def leakage(model, labels_norm: np.ndarray, bad_mask: np.ndarray, apogee_mask: np.ndarray,
-            std: np.ndarray, batch: int = 512) -> dict[str, dict]:
-    """Per element: mean |dF/dX| on forbidden pixels / mean on allowed pixels (physical units)."""
+def _abs_and_signed_jvp(model):
     fn, state = make_flux_fn(model, jit=False)
 
     @jax.jit
-    def abs_jvp(s, x, col):
+    def jvp(s, x, col):
         t = jnp.zeros_like(x).at[:, col].set(1.0)
-        return jnp.abs(jax.jvp(lambda xx: fn(s, xx), (x,), (t,))[1])
+        return jax.jvp(lambda xx: fn(s, xx), (x,), (t,))[1]
+
+    return jvp, state
+
+
+def _rows_batches(rows: np.ndarray, batch: int):
+    for s in range(0, len(rows), batch):
+        chunk = rows[s:s + batch]
+        n = len(chunk)
+        chunk, _ = pad_to_multiple(chunk, batch) if n < batch else (chunk, None)
+        yield jnp.asarray(chunk), n
+
+
+def leakage(model, labels_norm: np.ndarray, bad_mask: np.ndarray, apogee_mask: np.ndarray,
+            std: np.ndarray, batch: int = 512, cno_window: np.ndarray | None = None) -> dict[str, dict]:
+    """Per element: mean |dF/dX| on forbidden pixels / mean on allowed pixels (physical units).
+
+    Chip-gap pixels are neither (no data there). With ``cno_window`` (union of the C/N/O windows)
+    C_FE, N_FE and O_FE are reported too, against that union: CN, CO and OH couple C, N and O.
+    """
+    jvp, state = _abs_and_signed_jvp(model)
+    gap = gap_mask()
+    windows = {}
+    for lab in ATOMIC_LABELS:
+        allowed = apogee_mask[:, LABELS_27.index(lab)] > 0
+        if allowed.any():
+            windows[lab] = allowed
+    if cno_window is not None:
+        for lab in CNO_LABELS:
+            windows[lab] = np.asarray(cno_window, bool)
 
     results = {}
-    for lab in ATOMIC_LABELS:
+    for lab, allowed in windows.items():
         col = LABELS_27.index(lab)
-        allowed = apogee_mask[:, col] > 0
-        if not allowed.any():
-            continue
+        forbidden = ~allowed & ~gap
         rows = np.asarray(labels_norm, np.float32)[~np.asarray(bad_mask, bool)[:, col]]
         sums_f, sums_a, count = 0.0, 0.0, 0
-        for s in range(0, len(rows), batch):
-            chunk = rows[s:s + batch]
-            n = len(chunk)
-            chunk, _ = pad_to_multiple(chunk, batch) if n < batch else (chunk, None)
-            g = np.asarray(abs_jvp(state, jnp.asarray(chunk), col))[:n] / std[col]
-            sums_f += float(g[:, ~allowed].mean())
+        for chunk, n in _rows_batches(rows, batch):
+            g = np.abs(np.asarray(jvp(state, chunk, col)))[:n] / std[col]
+            sums_f += float(g[:, forbidden].mean())
             sums_a += float(g[:, allowed].mean())
             count += 1
         f, a = sums_f / max(count, 1), sums_a / max(count, 1)
         results[lab] = {"forbidden": f, "allowed": a, "ratio": f / a if a > 0 else float("inf")}
     return results
+
+
+def wrong_sign_fraction(model, labels_norm: np.ndarray, bad_mask: np.ndarray, apogee_mask: np.ndarray,
+                        batch: int = 512) -> dict[str, float]:
+    """Per atomic element: share of sum |dF/dX| over its own window pixels with dF/dX > 0.
+
+    More of X should deepen X's own lines (dF/dX <= 0 at fixed atmosphere); 0 = always physical,
+    NaN = no response at all. Rows where X was imputed are skipped.
+    """
+    jvp, state = _abs_and_signed_jvp(model)
+    out = {}
+    for lab in ATOMIC_LABELS:
+        col = LABELS_27.index(lab)
+        win = apogee_mask[:, col] > 0
+        if not win.any():
+            continue
+        rows = np.asarray(labels_norm, np.float32)[~np.asarray(bad_mask, bool)[:, col]]
+        pos = tot = 0.0
+        for chunk, n in _rows_batches(rows, batch):
+            g = np.asarray(jvp(state, chunk, col))[:n][:, win].astype(np.float64)
+            pos += float(np.clip(g, 0, None).sum())
+            tot += float(np.abs(g).sum())
+        out[lab] = pos / tot if tot > 0 else float("nan")
+    return out
+
+
+# Teff groups for the per-region chi^2 (giants: log g < 3.5); molecular bands grow toward cool giants.
+REGION_GROUPS: dict[str, Callable[[np.ndarray, np.ndarray], np.ndarray]] = {
+    "all": lambda t, g: np.ones_like(t, bool),
+    "Teff<4000 giants": lambda t, g: (t < 4000) & (g < 3.5),
+    "4000-4500 giants": lambda t, g: (t >= 4000) & (t < 4500) & (g < 3.5),
+    "4500-5000 giants": lambda t, g: (t >= 4500) & (t < 5000) & (g < 3.5),
+    "Teff>=5000 or dwarfs": lambda t, g: (t >= 5000) | (g >= 3.5),
+}
+
+
+def spectral_regions(apogee_mask: np.ndarray, cno_masks: dict[str, np.ndarray], threshold: float) -> dict:
+    """Disjoint real-pixel regions: any atomic window / C-N-O windows only / no window."""
+    gap = gap_mask()
+    elem = np.zeros(apogee_mask.shape[0], bool)
+    for lab in ATOMIC_LABELS:
+        elem |= apogee_mask[:, LABELS_27.index(lab)] > threshold
+    cno = np.zeros_like(elem)
+    for lab in CNO_LABELS:
+        cno |= np.asarray(cno_masks[lab], bool)
+    return {"element_windows": elem & ~gap, "cno_only": cno & ~elem & ~gap, "unassigned": ~elem & ~cno & ~gap}
+
+
+def region_chi2_summary(region_chi2: dict[str, np.ndarray], region_names: list[str], teff: np.ndarray,
+                        logg: np.ndarray) -> dict:
+    """Median per-region chi^2 for every Teff group: ``{group: {"N": n, model: {region: median}}}``."""
+    out = {}
+    for group, sel in REGION_GROUPS.items():
+        mask = sel(np.asarray(teff), np.asarray(logg))
+        out[group] = {"N": int(mask.sum())}
+        for name, rc in region_chi2.items():
+            out[group][name] = {r: (float(np.median(rc[mask, i])) if mask.any() else float("nan"))
+                                for i, r in enumerate(region_names)}
+    return out
 
 
 def _quantile_bins(x: np.ndarray, min_per_bin: int = 200) -> np.ndarray:
@@ -182,13 +289,14 @@ def leakage_plot(all_leakage: dict[str, dict], out_dir: Path) -> Path:
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    x = np.arange(len(ATOMIC_LABELS))
+    labels = list(ATOMIC_LABELS) + [c for c in CNO_LABELS if any(c in leak for leak in all_leakage.values())]
+    x = np.arange(len(labels))
     width = 0.8 / max(len(all_leakage), 1)
     fig, ax = plt.subplots(figsize=(14, 5))
     for i, (name, leak) in enumerate(all_leakage.items()):
-        ax.bar(x + i * width, [leak.get(el, {}).get("ratio", 0.0) for el in ATOMIC_LABELS], width, label=name)
+        ax.bar(x + i * width, [leak.get(el, {}).get("ratio", 0.0) for el in labels], width, label=name)
     ax.set_xticks(x + width * (len(all_leakage) - 1) / 2)
-    ax.set_xticklabels(ATOMIC_LABELS, rotation=45, ha="right")
+    ax.set_xticklabels(labels, rotation=45, ha="right")
     ax.set_ylabel("Leakage ratio (forbidden / allowed)")
     ax.set_title("Information leakage")
     ax.axhline(1.0, ls="--", color="grey", lw=0.8)

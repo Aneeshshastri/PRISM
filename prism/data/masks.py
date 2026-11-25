@@ -17,6 +17,20 @@ from prism.config import ABUND_INDICES, ATOMIC_LABELS, CNO_LABELS, LABELS_27, N_
 
 _CNO_FILES = {"C_FE": "C.filt", "N_FE": "N.filt", "O_FE": "O.filt"}
 N_PIXELS_FILT = 7514
+N_REAL_PIXELS = N_PIXELS_FILT
+# Detector chips (blue, green, red) as [start, stop) on the 8575-pixel grid; the rest are gaps
+# (flux 0 in the data, never in the loss).
+CHIPS: tuple[tuple[int, int], ...] = ((246, 3274), (3585, 6080), (6344, 8335))
+# element_idx key for the union of the C/N/O windows (the CNO expert of Config.cno_split models)
+CNO_KEY = "CNO"
+
+
+def gap_mask() -> np.ndarray:
+    """(8575,) True on chip-gap / edge pixels."""
+    gap = np.ones(N_PIXELS, bool)
+    for a, b in CHIPS:
+        gap[a:b] = False
+    return gap
 
 
 def insert_gaps(x7514: np.ndarray) -> np.ndarray:
@@ -25,9 +39,10 @@ def insert_gaps(x7514: np.ndarray) -> np.ndarray:
     if x.shape[0] != N_PIXELS_FILT:
         raise ValueError(f"expected {N_PIXELS_FILT} values, got {x.shape[0]}")
     full = np.zeros(N_PIXELS, np.float32)
-    full[246:3274] = x[0:3028]       # blue chip
-    full[3585:6080] = x[3028:5523]   # green chip
-    full[6344:8335] = x[5523:7514]   # red chip
+    off = 0
+    for a, b in CHIPS:  # blue 0:3028, green 3028:5523, red 5523:7514
+        full[a:b] = x[off:off + b - a]
+        off += b - a
     return full
 
 
@@ -43,14 +58,25 @@ def load_cno_masks(mask_dir: Path, threshold: float) -> dict[str, np.ndarray]:
             for lab, fname in _CNO_FILES.items()}
 
 
-def element_indices(apogee_mask: np.ndarray, threshold: float) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-    """Active pixel indices and weights per atomic label (ATOMIC_LABELS order)."""
+def element_indices(apogee_mask: np.ndarray, threshold: float,
+                    cno_masks: dict[str, np.ndarray] | None = None) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Active pixel indices and weights per atomic label (ATOMIC_LABELS order).
+
+    With ``cno_masks`` (``load_cno_masks``) the dict also holds ``CNO_KEY``: the union of the
+    C/N/O windows with unit weights — a pure routing mask for the CNO expert.
+    """
     out = {}
     for lab in ATOMIC_LABELS:
         col = LABELS_27.index(lab)
         active = np.where(apogee_mask[:, col] > threshold)[0]
         if len(active):
             out[lab] = (active.astype(np.int32), apogee_mask[active, col].astype(np.float32))
+    if cno_masks is not None:
+        union = np.zeros(N_PIXELS, bool)
+        for lab in CNO_LABELS:
+            union |= np.asarray(cno_masks[lab], bool)
+        active = np.where(union)[0].astype(np.int32)
+        out[CNO_KEY] = (active, np.ones(len(active), np.float32))
     return out
 
 

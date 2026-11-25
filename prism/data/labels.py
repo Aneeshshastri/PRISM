@@ -13,7 +13,7 @@ from sklearn.experimental import enable_iterative_imputer  # noqa: F401
 from sklearn.impute import IterativeImputer
 from sklearn.linear_model import BayesianRidge
 
-from prism.config import ABUNDANCE_INDICES, FE_H_INDEX, SELECTED_LABELS, SENTINEL_LABELS
+from prism.config import ABUNDANCE_INDICES, FE_H_INDEX, SELECTED_LABELS, SENTINEL_LABELS, STRUCTURAL_ZERO_LABELS
 
 _ZERO_ERR = ("VMICRO", "VMACRO", "VSINI")
 
@@ -31,11 +31,16 @@ def read_raw_flagged(h5, labels: list[str], start: int, end: int) -> tuple[np.nd
     """Raw label values (float64) and a bad mask for rows ``[start, end)``.
 
     Bad = non-finite, ``<LABEL>_FLAG != 0``, or a ``< -5000`` sentinel for the
-    core labels that have no flag column (including M_H).
+    core labels that have no flag column (including M_H). Labels in
+    STRUCTURAL_ZERO_LABELS (VSINI) are not measured for giants by design: their
+    NaNs become 0 and are not counted as bad.
     """
     meta = h5["metadata"]
     keys = meta.dtype.names
     raw = np.stack([meta[lab][start:end] for lab in labels], axis=1).astype(np.float64)
+    for i, lab in enumerate(labels):
+        if lab in STRUCTURAL_ZERO_LABELS:
+            raw[np.isnan(raw[:, i]), i] = 0.0
     bad = ~np.isfinite(raw)
     for i, lab in enumerate(labels):
         flag = f"{lab}_FLAG"

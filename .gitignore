@@ -220,3 +220,25 @@ map_results/
 laplace_results/
 nuts_results/
 *.npz.tmp
+
+# Local datasets (never commit)
+archive.zip
+*.h5
+
+# Local-only development (not part of the published repo)
+tests/
+tools/
+.claude/
+.codex/
+.gemini/
+.cursor/
+.vscode/
+*:Zone.Identifier
+
+# Dataset statistics, records and legacy-only window files
+dataset_stats_120k.npz
+apogee_inference_mask.npy
+element masks/
+prism_artifacts*/
+run_log.json
+*.out

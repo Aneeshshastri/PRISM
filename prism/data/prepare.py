@@ -8,7 +8,10 @@ Layout of ``cfg.cache_dir/<data_hash>/``::
     suppress.npy             (23, 8575) pixel suppression matrix for imputed labels
     {train,val,test}/labels.npy     (N, 27) float32, normalised
                      bad_mask.npy   (N, 23) bool, True = imputed
-                     flux.npy, ivar.npy (N, 8575) float32, raw
+                     flux.npy       (N, 8575) float32, raw
+    {train,val}/spl_weight.npy      (N, 8575) float16 loss weight 1e-5/(1/ivar+1e-5)
+                                    (training never needs ivar itself; float16 halves the I/O)
+    test/ivar.npy                   (N, 8575) float32 (evaluation / inversion need ivar)
                      weights.npy    (N,) float32 stratification weights
                      global_idx.npy (N,) int64 HDF5 row index
     test/label_err.npy (N, 23), test/snr.npy (N,)
@@ -55,6 +58,17 @@ def _copy_spectra(h5, name: str, start: int, end: int, out: Path) -> None:
     del arr
 
 
+def _copy_spl_weight(h5, start: int, end: int, out: Path) -> None:
+    from prism.losses import spl_weight
+
+    arr = np.lib.format.open_memmap(out, mode="w+", dtype=np.float16, shape=(end - start, h5["ivar"].shape[1]))
+    for s in range(start, end, CHUNK):
+        e = min(s + CHUNK, end)
+        arr[s - start:e - start] = np.asarray(spl_weight(h5["ivar"][s:e])).astype(np.float16)
+    arr.flush()
+    del arr
+
+
 def load_stats(prep_dir: Path) -> tuple[np.ndarray, np.ndarray]:
     with np.load(Path(prep_dir) / "stats.npz") as d:
         return d["mean"].astype(np.float32), d["std"].astype(np.float32)
@@ -97,7 +111,10 @@ def prepare_all(cfg: Config, force: bool = False) -> Path:
             np.save(d / "weights.npy", weights[split])
             np.save(d / "global_idx.npy", np.arange(s, e, dtype=np.int64))
             _copy_spectra(h5, "flux", s, e, d / "flux.npy")
-            _copy_spectra(h5, "ivar", s, e, d / "ivar.npy")
+            if split == "test":
+                _copy_spectra(h5, "ivar", s, e, d / "ivar.npy")
+            else:
+                _copy_spl_weight(h5, s, e, d / "spl_weight.npy")
             print(f"  {split:<5} {e - s:>7} stars, {int(bad[split].any(1).sum())} with imputed labels")
         s, e = ranges["test"]
         np.save(out / "test" / "label_err.npy", L.read_errors(h5, SELECTED_LABELS, s, e).astype(np.float32))

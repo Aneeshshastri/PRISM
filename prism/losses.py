@@ -16,22 +16,35 @@ def _sanitize(flux, ivar):
     return jnp.where(ok, flux, 1.0), jnp.where(ok, ivar, 1.0), ok
 
 
-def masked_spl_loss(pred, flux, ivar, pixel_mask, sample_weight, row_mask, badpix_cutoff: float = 1e-3):
-    """Masked spectral pixel loss (Keras ``sum_over_batch_size`` semantics, padding excluded).
+def spl_weight(ivar):
+    """Per-pixel spectral-loss weight ``1e-5 / (1/ivar + 1e-5)`` in [0, 1]; 0 where ivar is
+    NaN or <= 0. Training caches store this (as float16) instead of ivar."""
+    ivar = jnp.asarray(ivar, jnp.float32)
+    ok = (ivar > 0) & ~jnp.isnan(ivar)
+    safe = jnp.where(ok, ivar, 1.0)
+    return jnp.where(ok, SPL_FLOOR / (1.0 / safe + SPL_FLOOR), 0.0)
 
-    Per pixel: ``w = 1e-5 / (1/ivar + 1e-5)``, ``term = (flux - pred)^2 * w`` on
-    pixels with finite flux/ivar, ``ivar > 0``, ``flux > cutoff`` and
-    ``pixel_mask == 1``.
+
+def masked_spl_loss_w(pred, flux, weight, pixel_mask, sample_weight, row_mask, badpix_cutoff: float = 1e-3):
+    """Masked spectral pixel loss from precomputed ``spl_weight`` values.
+
+    Keras ``sum_over_batch_size`` semantics with padded rows excluded: per pixel
+    ``(flux - pred)^2 * weight`` on pixels with finite flux > cutoff and ``pixel_mask == 1``.
     """
     pred = jnp.asarray(pred, jnp.float32)
-    flux, ivar, ok = _sanitize(flux, ivar)
-    valid = ok & (flux > badpix_cutoff)
-    w = SPL_FLOOR / (1.0 / ivar + SPL_FLOOR)
-    resid = jnp.where(valid, flux - pred, 0.0)
-    term = resid ** 2 * w * jnp.asarray(pixel_mask, jnp.float32)
+    flux = jnp.asarray(flux, jnp.float32)
+    weight = jnp.asarray(weight, jnp.float32)
+    valid = jnp.isfinite(flux) & (flux > badpix_cutoff) & jnp.isfinite(weight)
+    resid = jnp.where(valid, jnp.where(valid, flux, 1.0) - pred, 0.0)
+    term = resid ** 2 * jnp.where(valid, weight, 0.0) * jnp.asarray(pixel_mask, jnp.float32)
     row = jnp.asarray(sample_weight, jnp.float32) * jnp.asarray(row_mask, jnp.float32)
     n_rows = jnp.maximum(jnp.sum(row_mask), 1.0)
     return jnp.sum(term * row[:, None]) / (n_rows * flux.shape[-1])
+
+
+def masked_spl_loss(pred, flux, ivar, pixel_mask, sample_weight, row_mask, badpix_cutoff: float = 1e-3):
+    """``masked_spl_loss_w`` with the weight computed from ivar (``w = 1e-5 / (1/ivar + 1e-5)``)."""
+    return masked_spl_loss_w(pred, flux, spl_weight(ivar), pixel_mask, sample_weight, row_mask, badpix_cutoff)
 
 
 def reduced_chi2(pred, flux, ivar, valid_extra=None, n_params: int = 23, var_floor: float = 1e-5,

@@ -435,7 +435,9 @@ def plot_residual_heatmap(data, save_dir=None):
     mads = np.where(mads < 1e-8, 1.0, mads)
     normed = np.abs(residuals) / mads[None, :]    # (n_stars, n_labels)
 
-    fig, ax = plt.subplots(figsize=(max(6, 0.15 * n_stars + 2), 7))
+    # width grows with star count but is capped: 0.15 in per star made a 1427-in figure for
+    # 9.5k stars and exhausted memory; imshow resamples the columns at this size
+    fig, ax = plt.subplots(figsize=(min(20, max(6, 0.15 * n_stars + 2)), 7))
     fig.patch.set_facecolor("white")
 
     im = ax.imshow(normed.T, aspect="auto", cmap="inferno",

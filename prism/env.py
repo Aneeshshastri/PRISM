@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 import subprocess
 
 import jax
@@ -41,8 +42,21 @@ def _fallback_hint() -> str:
     )
 
 
-def check_env(expected_gpus: int | None = 2, require_gpu: bool = True) -> dict:
-    """Print versions/devices, run a sharded smoke test, and fail loudly on a bad setup."""
+def default_expected_gpus() -> int:
+    """GPUs the notebooks expect: 2 on Kaggle T4 x2; set PRISM_EXPECTED_GPUS=1 for one local GPU."""
+    return int(os.environ.get("PRISM_EXPECTED_GPUS", "2"))
+
+
+_DEFAULT = object()
+
+
+def check_env(expected_gpus=_DEFAULT, require_gpu: bool = True) -> dict:
+    """Print versions/devices, run a sharded smoke test, and fail loudly on a bad setup.
+
+    ``expected_gpus`` defaults to ``default_expected_gpus()``; pass None to accept any count.
+    """
+    if expected_gpus is _DEFAULT:
+        expected_gpus = default_expected_gpus()
     info: dict = {
         "versions": {m: _version(m) for m in
                      ("jax", "jaxlib", "flax", "optax", "orbax.checkpoint", "blackjax", "numpy")},
@@ -73,7 +87,9 @@ def check_env(expected_gpus: int | None = 2, require_gpu: bool = True) -> dict:
         raise RuntimeError("No GPU visible to JAX.\n" + _fallback_hint())
     if expected_gpus is not None and require_gpu and len(gpus) != expected_gpus:
         raise RuntimeError(
-            f"Expected {expected_gpus} GPUs but JAX sees {len(gpus)}.\n" + _fallback_hint())
+            f"Expected {expected_gpus} GPUs but JAX sees {len(gpus)}.\n"
+            "Running on one local GPU? Set PRISM_EXPECTED_GPUS=1 (or call check_env(expected_gpus=1)).\n"
+            + _fallback_hint())
 
     # Sharded smoke test: rows split across the mesh, weights replicated.
     mesh = make_mesh()

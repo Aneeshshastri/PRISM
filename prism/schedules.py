@@ -23,3 +23,13 @@ def cosine_decay_restarts(init_lr: float, first_decay_steps: int, t_mul: float =
         return init_lr * ((1.0 - alpha) * cosine + alpha)
 
     return schedule
+
+
+def warmup_cosine(peak_lr: float, total_steps: int, warmup_steps: int = 0,
+                  final_fraction: float = 1e-3) -> optax.Schedule:
+    """Linear warm-up to ``peak_lr`` then a single cosine decay to ``peak_lr * final_fraction``
+    at ``total_steps`` (no restarts, so every model trains on the same schedule)."""
+    total_steps = max(int(total_steps), int(warmup_steps) + 1)
+    return optax.warmup_cosine_decay_schedule(init_value=peak_lr * final_fraction, peak_value=peak_lr,
+                                              warmup_steps=int(warmup_steps), decay_steps=total_steps,
+                                              end_value=peak_lr * final_fraction)
